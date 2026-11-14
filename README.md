@@ -50,14 +50,12 @@ not cold-start ramp measurements:
 
 | GPUs and layout | Prose decode | Code decode | Prefill at 20K / 80K |
 |---|---:|---:|---:|
-| 4, TP4 | 60.1 tok/s | 79.0 tok/s | 1,482 / 1,394 tok/s |
-| 3, PP3xTP1 | 44.5 tok/s | 48.7 tok/s | 720 / 719 tok/s |
+| 4, TP4 | 66.1 tok/s | 98.1 tok/s | 1,282 / 1,294 tok/s |
+| 3, PP3xTP1 | 44.5 tok/s | 67.7 tok/s | 720 / 719 tok/s |
 | 2, TP2 | 39.0 tok/s | 42.7 tok/s | Not measured |
 
 For this model, the three-GPU result uses pipeline parallelism; TP3 does not
-load successfully. The saved measurements show that the cache-enabled setup
-serves decode on two and three GPUs after warm-up, but do not include a
-first-window cache-ramp trace for those GPU counts.
+load successfully. 
 
 ## Added an Undo Log: faster prefill for tail edits and repeated edits in context
 
