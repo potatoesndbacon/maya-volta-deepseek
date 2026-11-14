@@ -4,7 +4,7 @@
 For the original information card of the main project, [click here](https://github.com/mw00/project-maya).
 
 This checkpoint is made to get the most performance possible out of Maya, Volta and Deepseek without hurting quality or changing numerics much on outputs.
-For that reason, top-k head reductions and expert tail skipping is not used, though can be a toggled option for even more speed, it hurts quality notably though.
+For that reason, top-k head pruning and expert tail skipping is not used, though can be a toggled option for even more speed, it hurts quality notably though.
 
 ## Context-length performance snapshot
 
