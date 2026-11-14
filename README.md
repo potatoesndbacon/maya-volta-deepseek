@@ -33,7 +33,7 @@ The two-request test used expert placement that differed from the one-slot setup
 Prefill aggregation spans the first request start through the later first output. 
 Decode aggregation spans the first output through the later completion, so overlap and queue time affect both aggregates.
 
-## Added an Undo Log: faster edits and faster prefill for tail edits in context
+## Added an Undo Log: faster prefill for tail edits and repeated edits in context
 
 An Undo Log compliments the slot prefix cache, helping further prefill savings. 
 During generation, the undo log with Maya keeps rolling attention-cache data. The undo log saves
