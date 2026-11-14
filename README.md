@@ -35,7 +35,7 @@ Decode aggregation spans the first output through the later completion, so overl
 
 ## Added an Undo Log: faster prefill for tail edits and repeated edits in context
 
-An Undo Log compliments the slot prefix cache, helping further prefill savings. 
+An Undo Log complements the slot prefix cache, helping further prefill savings. 
 During generation, the undo log with Maya keeps rolling attention-cache data. The undo log saves
 the cache entries that are about to be overwritten. If you revise the end of a
 prompt in the same live session, Maya with an undo log can restore those saved entries and
