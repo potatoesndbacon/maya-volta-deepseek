@@ -29,25 +29,6 @@ workload, or host.
 | `src/ds4/ds4_model.hpp` — expose undo counters in model statistics. | No inference-speed gain measured. |
 | `src/kernels/cpu/iq_avx2.cpp` — add a compiler unroll hint to the IQ1_M row-dot loop. | No isolated gain measured. |
 
-### End-to-end comparison
-
-A bounded three-prompt API comparison measured median decode throughput as
-follows. Each arm used the same model pack, stock DSpark, TP4, and up to 400
-generated tokens; the production build was measured before and after the fork
-build to expose run-to-run drift.
-
-| Prompt | Production before | Fork build |
-|---|---:|---:|
-| Code | 96.3 tok/s | 98.3 tok/s | 
-| Prose | 67.5 tok/s | 66.9 tok/s | 
-| Workflow | 83.2 tok/s | 84.0 tok/s | 
-
-The fork was slightly faster than the first production run on code and workflow
-and slightly slower on prose. Production control rates drifted between runs;
-response hashes also differed. With three measured requests per prompt, this
-does not establish a repeatable overall speedup or output equivalence. Full
-method and test limits are in [`BUILD-VALIDATION.md`](BUILD-VALIDATION.md).
-
 ## Build
 
 The validated configuration used CMake 3.31.6, CUDA 12.8.93, GCC 12.2, Release
