@@ -12,6 +12,8 @@ each context/mode has one sample, so treat these as a workload snapshot rather
 than a general benchmark. The saved run contains 2K, 8K, 32K, 64K, 128K, 256K,
 and 512K contexts. The requested 16K and 1M results were not recorded.
 
+Note that for 2 32gb cards, having more than 128gb of memory is mandatory for this quant.
+
 For two simultaneous requests, each request's rate is shown as `A / B`, followed
 by the measured aggregate rate in parentheses. Aggregate rates use the elapsed
 pair-wide window and are not the sum of A and B.
@@ -36,17 +38,8 @@ Decode aggregation spans the first output through the later completion, so overl
 ## Expert-cache warm-up and GPU-count measurements
 
 The expert swap cache learns which experts are being routed and moves frequently
-used experts into VRAM. In a measured four-card TP4 cold-start probe with the
-cache enabled, the first 100 generated tokens ran at 37.9 tok/s; the next
-100-token windows measured 58.5, 58.1, and 52.1 tok/s. A second generation in
-the same process started at 62.8 tok/s. With the tuned promotion settings,
-`DS4_CACHE_MARGIN=1.0` and `DS4_CACHE_BONUS=0.25`, the recorded cold ramp was
-one slower window, about 0.9 seconds per process. Warm-process probes showed no
-first-window ramp.
-
-The separate GPU-count benchmark measured warmed decode on the same model and
-bias-0 expert-cache setup. These are steady-state measurements after a warm-up,
-not cold-start ramp measurements:
+used experts into VRAM. In this checkpoint, the router ramps FAST and AGGRESSIVELY as much as it can without cache trashing,
+with the tuned promotion settings, `DS4_CACHE_MARGIN=1.0` and `DS4_CACHE_BONUS=0.25`.
 
 | GPUs and layout | Prose decode | Code decode | Prefill at 20K / 80K |
 |---|---:|---:|---:|
