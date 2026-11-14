@@ -1102,12 +1102,17 @@ void iq_cpu_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, cons
         const int nr = r1 - r0;
         thread_local std::vector<float> buf;
         thread_local std::vector<float*> go, uo;
+        static thread_local int layout_nt = 0, layout_nr = 0;
         buf.resize((size_t) 2 * nt * nr);
-        go.resize((size_t) nt);
-        uo.resize((size_t) nt);
-        for (int t = 0; t < nt; ++t) {
-            go[(size_t) t] = buf.data() + (size_t) t * nr;
-            uo[(size_t) t] = buf.data() + (size_t) (nt + t) * nr;
+        if (layout_nt != nt || layout_nr != nr) {
+            go.resize((size_t) nt);
+            uo.resize((size_t) nt);
+            for (int t = 0; t < nt; ++t) {
+                go[(size_t) t] = buf.data() + (size_t) t * nr;
+                uo[(size_t) t] = buf.data() + (size_t) (nt + t) * nr;
+            }
+            layout_nt = nt;
+            layout_nr = nr;
         }
         own_rows(f.tg, gate, f.gu_row, f.n_embd, act, nt, go.data(), r0, r1);
         own_rows(f.tg, up, f.gu_row, f.n_embd, act, nt, uo.data(), r0, r1);

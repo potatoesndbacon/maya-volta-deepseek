@@ -10,6 +10,7 @@
 //   moe(x): 6 of 384 routed experts (sqrt-softplus scores, biased top-k) + the shared expert
 //   h = post * moe + comb^T h;  pre = f_pre
 // and after the last layer logits = head(rmsnorm(sum_s pre[s] h[s])).
+#include <cuda_profiler_api.h>   // (Phase 8AL) cudaProfilerStart/Stop for the capture range
 #include "ds4_model.hpp"
 #include "ds4_borrow.hpp"
 #include "ds4_cpu_exl3.hpp"
@@ -625,6 +626,10 @@ struct Dev {
     TopkScratch tks;                                   // a window's indexer top k over long rows (topk's segments)
     unsigned long long* plan_ptr = nullptr;           // the decode path's VRAM experts (0: on the CPU lane)
     int* cpu_any = nullptr;                           // the window's routing has a CPU-lane pick (route_publish's)
+    // (Phase 8BQ) the plan buffer for the position-dependent shape: [0] = ng (the compressed groups this window
+    // completes), [1] = g_first. Written per window; nothing reads it yet, so adding it cannot change a result.
+    int* ng_dev = nullptr;
+    int64_t* pos_dev = nullptr;                       // the window's p0, for the same purpose
     uint8_t* eg_rows = nullptr;
     uint16_t *emb_rows = nullptr, *ext = nullptr;   // the window's embedding rows; the window attention's rows
     AttnScratch attn_scr;   // a few queries' selected compressed rows decoded (sparse_attn)
@@ -680,6 +685,9 @@ struct Dev {
     // (--parallel) a multi step's new compressed rows of each row's conversation gathered for the other groups' readers:
     // kWin ckv rows, then kWin index-key rows
     uint8_t* mstage = nullptr;
+    // (8CC) replicate's source staging: the source's g_first-offset rows gathered here before the host copy-out,
+    // so the staged memcpy's source pointer is stable (capture-ready)
+    uint8_t* rep_stage = nullptr;
     // (DS4_MULTI_ATTN) a multi step's window buffers side by side, and the few-queries scratch for all its rows; the
     // layer's plan of them (layer(), on this device's thread)
     uint16_t* mext = nullptr;
@@ -954,6 +962,12 @@ struct Layer {
     // the window's raw rows (kv, then score) to replay the accepted ones
     uint8_t* ring_bak = nullptr;
     float *c_snap = nullptr, *c_rows = nullptr;
+    // the undo log (DS4_UNDO_LOG>0, Phase 8BL): the ring rows and the compressor's overwritten slots over the horizon,
+    // so restore() can rewind within it without a full Check.  undo_ring: H rows of win_rb(), index (pos % H).  undo_kv
+    // / undo_sc: H rows of hd floats, the compressor's overwritten slot (pos % ratio) each token, index (pos % H).
+    // nullptr when off (default): nothing allocated, nothing written - bit-identical to before.
+    uint8_t* undo_ring = nullptr;
+    float *undo_kv = nullptr, *undo_sc = nullptr;
     unsigned long long* vram_tab = nullptr;     // device [n_exp]
     std::vector<std::array<x3::Mat, 3>> vm;     // expert -> its gate, up, down as EXL3 views of its VRAM blob
     std::vector<uint64_t> region_off;           // expert -> file region (offset, bytes, file)
@@ -1400,6 +1414,7 @@ struct Model::Impl {
     // by xfer_put / xfer_get (host-mapped rows and a flag, as the pipeline's groups hand theirs) instead of copies
     // through pinned memory and events
     int decode_trim = 0;
+    bool pipe_p2p = false; // (DS4_PIPE_P2P: experimental direct layer-pipeline peer copies)
     unsigned d_xseq = 0;   // (DS4_DECODE_TRIM 8) the drafter's hand-off sequence (its flags only ever rise)
     size_t dhand_x() const { return (size_t) kWin * ((size_t) g.hc * g.dim * 4 + 8 * 4); }   // (the x rows' offset)
     size_t dhand_bytes() const { return dhand_x() + (size_t) kWin * g.dim * 4; }
@@ -1521,6 +1536,10 @@ struct Model::Impl {
     // the state
     int64_t pos = 0;
     std::vector<int32_t> toks, ctoks;
+    // the undo log (DS4_UNDO_LOG) covers positions [undo_log_from, pos): every write there is in the log.  A verify
+    // window's accepted rows are not logged (spec_win), so undo_log_from advances past them in rollback(); restore()
+    // rewinds from the log only at or after it, else it falls back to a full Check.
+    int64_t undo_log_from = 0;
     struct Check {                    // the state at a position: every window ring, the compressors' partial groups
         int64_t pos = -1;
         std::vector<std::vector<uint8_t>> win;
@@ -1545,12 +1564,15 @@ struct Model::Impl {
     // device pointers stay here, the bound one's too.
     struct SeqState {
         int64_t pos = 0;
+        int64_t undo_log_from = 0;   // the undo log's coverage for this conversation (see Impl::undo_log_from)
         std::vector<int32_t> toks, ctoks;
         Check ck[3];
         std::vector<Check> mk;
         bool slot_held = false;
         std::vector<uint8_t*> win;                   // [layer member] (sq_base[layer] + member)
         std::vector<float*> c_kv, c_score;
+        std::vector<uint8_t*> undo_ring;             // the conversation's own undo log (DS4_UNDO_LOG), if on
+        std::vector<float*> undo_kv, undo_sc;
         std::vector<std::vector<uint8_t*>> ckv, ik;   // [source][device]
     };
     std::vector<SeqState> sqs;   // empty: one conversation (Options::seqs 1)
@@ -1770,6 +1792,17 @@ struct Model::Impl {
         unsigned win = 0;   // (win_now at the tick that queued it)
     };
     static constexpr int kMaxSwaps = 8;
+    // (Phase 8AY) STRATA_DS4_CACHE_SCORE=1: heat a pick by the weight it carried, not just by the fact that it was
+    // picked. A pick with w x k = 1 is an ordinary one (uniform weights reproduce the old `+= 1` exactly, so the
+    // measured MARGIN/BONUS keep their scale); an expert that carried a token counts for more than one that barely
+    // won its slot. HybriMoE's score-based caching, reduced to the one line our bookkeeping needs.
+    static bool heat_scored() {
+        static const bool on = [] {
+            const char* v = ds4_env("STRATA_DS4_CACHE_SCORE");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        return on;
+    }
     // the swap rule: a CPU-lane expert in when its heat passes the coldest VRAM one's x margin + bonus; heat x decay
     // every 256 tokens; at most `inflight` swaps under way (DS4_CACHE_MARGIN / _BONUS / _DECAY / _INFLIGHT)
     static float env_f(const char* k, float d) { return std::getenv(k) ? (float) std::atof(std::getenv(k)) : d; }
@@ -3749,6 +3782,10 @@ struct Model::Impl {
                              decode_trim & 4 ? " the snapshot / latent copies one kernel each;" : "",
                              decode_trim & 8 ? " the drafter's hand-offs by xfer;" : "");
         }
+        if (const char* v = ds4_env("DS4_PIPE_P2P")) {
+            pipe_p2p = std::strcmp(v, "1") == 0;
+            if (pipe_p2p) std::fprintf(stderr, "ds4: DS4_PIPE_P2P=1: experimental direct pipeline peer copies requested\n");
+        }
         if (const char* v = ds4_env("DS4_ROUTE_FUSE")) {   // (MAYA_DS4_ROUTE_FUSE)
             if (std::strcmp(v, "1") != 0 && std::strcmp(v, "2") != 0 && std::strcmp(v, "0") != 0) {
                 err = std::string("DS4_ROUTE_FUSE=") + v + ": 2, 1 or 0";
@@ -4345,8 +4382,10 @@ struct Model::Impl {
                       dalloc(d, d.tok, 16, err) && dalloc(d, d.emb_rows, W * D, err) &&
                       dalloc(d, d.ext, ((size_t) g.win + W) * g.hd, err) && dalloc(d, d.xe, P * D, err) &&
                       dalloc(d, d.xg, P * g.ff, err) && dalloc(d, d.xu, P * g.ff, err) && dalloc(d, d.xhh, P * g.ff, err) &&
-                      dalloc(d, d.ed, P * D, err) && dalloc(d, d.plan_ptr, P, err) && dalloc(d, d.cpu_any, 1, err);
+                      dalloc(d, d.ed, P * D, err) && dalloc(d, d.plan_ptr, P, err) && dalloc(d, d.cpu_any, 1, err) &&
+                      dalloc(d, d.ng_dev, 2, err) && dalloc(d, d.pos_dev, 1, err);
             if (!ok) return false;
+            if (!dalloc(d, d.rep_stage, (size_t) kWin * (ckv_rb() + ik_rb()), err)) return false;
             CK(cudaMemset(d.cpu_any, 0, sizeof(int)));
             d.attn_scr.max_t = kAttnScratchT;
             d.attn_scr.cap = (int) topk_stride();
@@ -6847,6 +6886,18 @@ struct Model::Impl {
                 }
             }
             if (!dalloc(d, l.win, (size_t) g.win * win_rb(), err, &d.caches)) return false;
+            if (undo_h() > 0 && !l.mtp) {   // (the undo log's overwritten rows: H ring rows + H compressor slot rows)
+                const bool host = undo_host();
+                if (host ? !hmap(l.undo_ring, (size_t) undo_h() * win_rb(), err)
+                         : !dalloc(d, l.undo_ring, (size_t) undo_h() * win_rb(), err))
+                    return false;
+                if (l.kv_src && l.ratio > 1 &&
+                    (host ? (!hmap(l.undo_kv, (size_t) undo_h() * g.hd, err) ||
+                             !hmap(l.undo_sc, (size_t) undo_h() * g.hd, err))
+                          : (!dalloc(d, l.undo_kv, (size_t) undo_h() * g.hd, err) ||
+                             !dalloc(d, l.undo_sc, (size_t) undo_h() * g.hd, err))))
+                    return false;
+            }
             if (spec_bufs() && !l.mtp) {   // (a verify window's backups: the rows and states a rejected draft undoes)
                 // (--parallel: a multi step's verify windows share the window's rows - the ring's backups and the
                 //  compressor's rows by row - and each its own compressor snapshot, one a conversation)
@@ -9626,6 +9677,9 @@ struct Model::Impl {
             q.win.assign((size_t) nmem, nullptr);
             q.c_kv.assign((size_t) nmem, nullptr);
             q.c_score.assign((size_t) nmem, nullptr);
+            q.undo_ring.assign((size_t) nmem, nullptr);
+            q.undo_kv.assign((size_t) nmem, nullptr);
+            q.undo_sc.assign((size_t) nmem, nullptr);
             q.ckv.assign(srcs.size(), std::vector<uint8_t*>(devs.size(), nullptr));
             q.ik.assign(srcs.size(), std::vector<uint8_t*>(devs.size(), nullptr));
             for (size_t i = 0; i < L.size(); ++i)
@@ -9636,12 +9690,26 @@ struct Model::Impl {
                         q.win[k] = l.win;
                         q.c_kv[k] = l.c_kv;
                         q.c_score[k] = l.c_score;
+                        q.undo_ring[k] = l.undo_ring;
+                        q.undo_kv[k] = l.undo_kv;
+                        q.undo_sc[k] = l.undo_sc;
                         continue;
                     }
                     Dev& d = devs[(size_t) l.dev];
                     if (!dalloc(d, q.win[k], (size_t) g.win * win_rb(), err, &d.caches)) return false;
                     if (l.c_kv != nullptr && !dalloc(d, q.c_kv[k], (size_t) l.ratio * g.hd, err, &d.caches)) return false;
                     if (l.c_score != nullptr && !dalloc(d, q.c_score[k], (size_t) l.ratio * g.hd, err, &d.caches))
+                        return false;
+                    const bool uhost = undo_host();
+                    if (undo_h() > 0 && l.undo_ring != nullptr &&
+                        (uhost ? !hmap(q.undo_ring[k], (size_t) undo_h() * win_rb(), err)
+                               : !dalloc(d, q.undo_ring[k], (size_t) undo_h() * win_rb(), err, &d.caches)))
+                        return false;
+                    if (undo_h() > 0 && l.undo_kv != nullptr &&
+                        (uhost ? (!hmap(q.undo_kv[k], (size_t) undo_h() * g.hd, err) ||
+                                  !hmap(q.undo_sc[k], (size_t) undo_h() * g.hd, err))
+                               : (!dalloc(d, q.undo_kv[k], (size_t) undo_h() * g.hd, err, &d.caches) ||
+                                  !dalloc(d, q.undo_sc[k], (size_t) undo_h() * g.hd, err, &d.caches))))
                         return false;
                 }
             for (size_t j = 0; j < srcs.size(); ++j)
@@ -9684,6 +9752,7 @@ struct Model::Impl {
     void seq_park() {
         SeqState& q = sqs[(size_t) sq_bound];
         q.pos = pos;
+        q.undo_log_from = undo_log_from;
         q.toks = std::move(toks);
         q.ctoks = std::move(ctoks);
         for (int i = 0; i < 3; ++i) q.ck[i] = std::move(ck[i]);
@@ -9696,6 +9765,8 @@ struct Model::Impl {
     void seq_unpark() {
         SeqState& q = sqs[(size_t) sq_bound];
         pos = q.pos;
+        undo_log_from = q.undo_log_from;
+        if (undo_log_from > pos) undo_log_from = pos;   // (never a floor past the state; 8BO.3)
         toks = std::move(q.toks);
         ctoks = std::move(q.ctoks);
         for (int i = 0; i < 3; ++i) ck[i] = std::move(q.ck[i]);
@@ -9716,6 +9787,9 @@ struct Model::Impl {
                 l.win = q.win[k];
                 l.c_kv = q.c_kv[k];
                 l.c_score = q.c_score[k];
+                l.undo_ring = q.undo_ring[k];
+                l.undo_kv = q.undo_kv[k];
+                l.undo_sc = q.undo_sc[k];
             }
         if (mtp_only) return;
         for (size_t j = 0; j < srcs.size(); ++j)
@@ -9729,7 +9803,7 @@ struct Model::Impl {
         seq_park();
         sq_bound = s;
         seq_point(s);
-        seq_unpark();
+        seq_unpark();   // (the conversation's own undo log + undo_log_from come back with it: nothing to reset)
     }
     int64_t seq_pos(int s) const { return sqs.empty() || s == sq_bound ? pos : sqs[(size_t) s].pos; }
     const std::vector<int32_t>& seq_tokens(int s) const {
@@ -9741,6 +9815,7 @@ struct Model::Impl {
         toks.clear();
         ctoks.clear();
         slot_held = false;
+        undo_log_from = 0;
         ck[0].pos = ck[1].pos = ck[2].pos = -1;
         mk.clear();
         for (Layer& l0 : L)
@@ -9794,6 +9869,35 @@ struct Model::Impl {
         }();
         return n;
     }
+    // the undo log's horizon in tokens (DS4_UNDO_LOG, 0: off - restore() uses full Check snapshots only).  When off the
+    // per-layer buffers are not allocated and the write hooks are not taken, so the run is bit-identical to before.
+    static int undo_h() {
+        static const int n = [] {
+            const char* v = ds4_env("DS4_UNDO_LOG");
+            return v != nullptr ? std::max(0, std::atoi(v)) : 0;
+        }();
+        return n;
+    }
+    // DS4_UNDO_HOST=1: the undo log in pinned host memory (device-mapped) instead of VRAM, trading the ~132 MB/GPU it
+    // would take from the expert cache for a few % of PCIe traffic on the hot path - and freeing VRAM for a much longer
+    // horizon (host RAM is cheap here: 0 = VRAM, the default).
+    static bool undo_host() {
+        static const bool on = [] {
+            const char* v = ds4_env("DS4_UNDO_HOST");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        return on;
+    }
+    // DS4_UNDO_VERIFY=1: after a log rewind, read the ring back and check every touched slot against the log's own
+    // p_min formula (the value the kernel must have written).  Off by default; it catches the one fault that would
+    // otherwise be silent - a write the log failed to record - on one ring layer and one compressor per device.
+    static bool undo_verify_on() {
+        static const bool on = [] {
+            const char* v = ds4_env("DS4_UNDO_VERIFY");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        return on;
+    }
     // the state at pos as a restore point a request asked for (shared: the end of a shared start, given up last); one
     // at this position already is kept (it holds the same state), else the one mark_victim() picks makes room
     void mark(bool shared) {
@@ -9831,6 +9935,10 @@ struct Model::Impl {
         return latest_point(at, limit, pos);
     }
     int64_t restorable(int64_t limit) const {
+        // the undo log (DS4_UNDO_LOG) can rewind to `limit` itself when the distance is within the horizon and no spec
+        // gap lies in the range - no checkpoint needed there, which is what makes a mid-prompt edit cheap without marks
+        const int uh = undo_h();
+        if (uh > 0 && limit > 0 && limit <= pos && pos - limit <= (int64_t) uh && limit >= undo_log_from) return limit;
         const int b = best_check(limit);
         return b < 0 ? -1 : check_at(b).pos;
     }
@@ -9865,7 +9973,167 @@ struct Model::Impl {
         return n;
     }
 
+    // a verify window's ACCEPTED ring rows into the undo log (single conversation): row i < keep from ring_bak[i] and
+    // the compressor's overwritten slot (snap[slot] if i < ratio, else the window's raw row i - ratio).
+    void undo_commit_single(int64_t p0, int keep) {
+        const int uh = undo_h();
+        std::vector<UndoCommitBatch> cb(devs.size());
+        for (int il = 0; il < g.nl; ++il)
+            for (int m = 0; m < L[(size_t) il].nm; ++m) {
+                Layer& l = member(L[(size_t) il], m);
+                if (l.undo_ring == nullptr && l.undo_kv == nullptr) continue;
+                UndoCommitBatch& b = cb[(size_t) l.dev];
+                b.undo_ring[b.n] = l.undo_ring;
+                b.ring_bak[b.n] = l.ring_bak;
+                b.undo_kv[b.n] = l.undo_kv;
+                b.undo_sc[b.n] = l.undo_sc;
+                b.snap[b.n] = l.c_snap;
+                b.kv_rows[b.n] = l.c_rows;
+                b.sc_rows[b.n] = l.c_rows ? l.c_rows + (size_t) kWin * g.hd : nullptr;
+                b.ratio[b.n++] = l.ratio;
+            }
+        for (size_t di = 0; di < devs.size(); ++di)
+            if (cb[di].n > 0) {
+                cudaSetDevice(devs[di].id);
+                undo_commit_batch(cb[di], p0, keep, uh, g.hd, devs[di].st);
+            }
+    }
+
+    // DS4_UNDO_VERIFY: after a log rewind, read the ring back and check every slot the rewind touched against the
+    // value ring_undo_batch/comp_undo_batch must have written for it (the per-slot p_min formulation in
+    // ds4_undo_log.hpp).  One ring layer and one compressor per device: a systematic (missed-hook) fault shows up at
+    // once; a one-off would need the whole set.  Rewinds are rare, so the blocking read-back is moot.
+    bool undo_verify(int64_t limit, int64_t hi) {
+        const int uh = undo_h();
+        if (uh <= 0) return true;
+        const bool uhost = undo_host();
+        auto rd = [](void* dst, const void* src, size_t n) -> bool {
+            if (cudaMemcpy(dst, src, n, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                std::fprintf(stderr, "undo-verify: read-back failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+                return false;
+            }
+            return true;
+        };
+        size_t checked = 0, bad = 0;
+        for (size_t di = 0; di < devs.size(); ++di) {
+            Dev& d = devs[(size_t) di];
+            cudaSetDevice(d.id);
+            const Layer* rl = nullptr;
+            const Layer* cl = nullptr;
+            for (size_t i = 0; i < L.size() && (rl == nullptr || cl == nullptr); ++i)
+                for (int m = 0; m < L[i].nm; ++m) {
+                    Layer& l = member(L[i], m);
+                    if (l.dev != (int) di) continue;
+                    if (rl == nullptr && l.undo_ring != nullptr) rl = &l;
+                    if (cl == nullptr && l.undo_kv != nullptr) cl = &l;
+                }
+            if (rl != nullptr) {
+                const int win = g.win;
+                const size_t rb = win_rb();
+                std::vector<uint8_t> ring((size_t) win * rb), row(rb);
+                if (!rd(ring.data(), rl->win, ring.size())) return false;
+                for (int s = 0; s < win; ++s) {
+                    const int64_t pmin = limit + ((s - limit) % win + win) % win;
+                    if (pmin > hi - 1) continue;
+                    const int64_t lr = (pmin % uh + uh) % uh;
+                    if (uhost)
+                        std::memcpy(row.data(), rl->undo_ring + (size_t) lr * rb, rb);
+                    else if (!rd(row.data(), rl->undo_ring + (size_t) lr * rb, rb))
+                        return false;
+                    ++checked;
+                    if (std::memcmp(ring.data() + (size_t) s * rb, row.data(), rb) != 0) ++bad;
+                }
+            }
+            if (cl != nullptr) {
+                const int ratio = cl->ratio;
+                const size_t hd = (size_t) g.hd;
+                std::vector<float> stv((size_t) ratio * hd), row(hd);
+                if (!rd(stv.data(), cl->c_kv, stv.size() * sizeof(float))) return false;
+                for (int s = 0; s < ratio; ++s) {
+                    const int64_t pmin = limit + ((s - limit) % ratio + ratio) % ratio;
+                    if (pmin > hi - 1) continue;
+                    const int64_t lr = (pmin % uh + uh) % uh;
+                    if (uhost)
+                        std::memcpy(row.data(), cl->undo_kv + (size_t) lr * hd, hd * sizeof(float));
+                    else if (!rd(row.data(), cl->undo_kv + (size_t) lr * hd, hd * sizeof(float)))
+                        return false;
+                    ++checked;
+                    if (std::memcmp(stv.data() + (size_t) s * hd, row.data(), hd * sizeof(float)) != 0) ++bad;
+                }
+            }
+        }
+        std::fprintf(stderr, "undo-verify: %s (%zu slots checked, %zu bad)\n", bad == 0 ? "OK" : "FAIL", checked, bad);
+        return bad == 0;
+    }
+
+    // restore()'s undo-log path: rewind the ring and the compressor partials from pos back to limit (the log covers
+    // it), then the same bookkeeping as restore()'s tail.  The compressed-KV source and the index keys are indexed by
+    // position, so they are left in place and re-written when the prompt is read again from limit.
+    void undo_rewind(int64_t limit) {
+        const int uh = undo_h();
+        const int64_t from = pos;   // (for the log line: how far back, and to where)
+        std::vector<UndoBatch> rb(devs.size());
+        std::vector<CompUndoBatch> cb(devs.size());
+        for (size_t i = 0; i < L.size(); ++i)
+            for (int m = 0; m < L[i].nm; ++m) {
+                Layer& l = member(L[i], m);
+                if (l.undo_ring != nullptr) {
+                    UndoBatch& b = rb[(size_t) l.dev];
+                    b.ring[b.n] = l.win;
+                    b.log[b.n++] = l.undo_ring;
+                }
+                if (l.undo_kv != nullptr) {
+                    CompUndoBatch& c = cb[(size_t) l.dev];
+                    c.kv_state[c.n] = l.c_kv;
+                    c.score_state[c.n] = l.c_score;
+                    c.log_kv[c.n] = l.undo_kv;
+                    c.log_sc[c.n] = l.undo_sc;
+                    c.ratio[c.n++] = l.ratio;
+                }
+            }
+        for (size_t di = 0; di < devs.size(); ++di) {
+            cudaSetDevice(devs[di].id);
+            if (rb[di].n > 0) ring_undo_batch(rb[di], limit, pos, g.win, uh, g.hd, devs[di].st);
+            if (cb[di].n > 0) comp_undo_batch(cb[di], limit, pos, uh, g.hd, devs[di].st);
+            cudaStreamSynchronize(devs[di].st);
+        }
+        if (undo_verify_on()) undo_verify(limit, pos);   // (pos is still the pre-rewind end here)
+        pos = limit;
+        toks.resize((size_t) pos);
+        ctoks.resize((size_t) pos);
+        slot_held = false;
+        for (Check& o2 : ck)   // a later checkpoint saw tokens the state no longer has
+            if (o2.pos > pos) o2.pos = -1;
+        mk.erase(std::remove_if(mk.begin(), mk.end(), [this](const Check& x) { return x.pos > pos; }), mk.end());
+        for (Check& x : mk)   // (a mark gone back to: in use)
+            if (x.pos == pos) x.used = ++mark_clock;
+        // DS4_UNDO_LOG fired: an edit's rewind reused the conversation's own KV instead of a full re-read.  stderr only
+        // (device printf never reaches the log), and only on this path - a normal prompt (continuation / new) never
+        // gets here, so the common case pays nothing.
+        st.undo_hits++;
+        st.undo_reused += limit;             // (the kept prefix: the tokens this rewind reused)
+        st.undo_rewound += from - limit;     // (the tokens the log rewound: pos - limit)
+        std::fprintf(stderr, "undo: rewound %lld tokens (from %lld back to %lld), DS4_UNDO_LOG=%d\n",
+                     (long long) (from - limit), (long long) from, (long long) limit, uh);
+    }
+
     bool restore(int64_t limit) {
+        const int uh = undo_h();
+        // the undo-log path: rewind within the horizon (and with no spec gap in the range) instead of a full Check
+        if (uh > 0 && limit > 0 && limit <= pos && pos - limit <= (int64_t) uh && limit >= undo_log_from) {
+            undo_rewind(limit);
+            return true;
+        }
+        if (uh > 0) {   // (an edit that the undo log did not cover: say why, then fall back to a Check)
+            st.undo_misses++;
+            std::fprintf(stderr, "undo: miss (pos %lld, limit %lld, horizon %d, undo_log_from %lld: %s)\n",
+                         (long long) pos, (long long) limit, uh, (long long) undo_log_from,
+                         (limit <= 0)                     ? "no prefix to keep"
+                         : (limit > pos)                  ? "limit past the end"
+                         : (pos - limit > (int64_t) uh)   ? "beyond the horizon"
+                         : (limit < undo_log_from)        ? "below the log's floor (slot-loaded content)"
+                                                          : "a spec gap in the range");
+        }
         const int b = best_check(limit);
         if (b < 0) return false;
         const Check& c = check_at(b);
@@ -9886,6 +10154,9 @@ struct Model::Impl {
             cudaStreamSynchronize(d.st);
         }
         pos = c.pos;
+        if (undo_log_from > pos) undo_log_from = pos;   // (a checkpoint fallback below a slot-loaded conversation's
+                                                        //  load point must not leave the log's floor past the state;
+                                                        //  8BO.3: a stale floor made every later rewind miss)
         toks.resize((size_t) pos);
         ctoks.resize((size_t) pos);
         slot_held = false;
@@ -10270,6 +10541,7 @@ struct Model::Impl {
             return false;
         }
         pos = n_pos;
+        undo_log_from = pos;   // (the slot's ring/compressor were loaded, not the undo log: trust it only from here)
         toks.swap(toks_in);
         ctoks.resize((size_t) pos);
         for (size_t i = 0; i < (size_t) pos; ++i)
@@ -15245,7 +15517,7 @@ struct Model::Impl {
                         const int e = r.ids[t][i];
                         if (e < 0 || e >= l.n_exp) continue;
                         ++pr[e];
-                        l.heat[(size_t) e] += 1.0f;
+                        l.heat[(size_t) e] += heat_scored() ? r.w[t][i] * (float) l.k_exp : 1.0f;
                         if (fl != nullptr) {
                             ++st.ahead_picks;
                             st.ahead_hit_k += fl[e] & 1;
@@ -17467,6 +17739,7 @@ struct Model::Impl {
         }
         drafts_q = false;
         rollback(p0, T, m + 1);
+
         if (!seed_drafter(p0, m + 1, 0, err)) return false;
         accepted = m;
         st.drafts_offered += n;
@@ -17481,6 +17754,7 @@ struct Model::Impl {
     // a verified window keeps its first `keep` positions: the ring rows and the compressors' state of the rest undone
     // (the compressed KV and the index keys past them are written again when those positions come)
     void rollback(int64_t p0, int T, int keep) {
+        if (undo_h() > 0 && keep > 0) undo_commit_single(p0, keep);   // log the accepted spec rows for restore()
         if (keep >= T) return;
         // the ring rows: one launch a device for all its layers (a launch a layer and member was ~300 on 8-way tensor
         // parallel, a millisecond of the host's before the next draft)
@@ -17540,6 +17814,25 @@ struct Model::Impl {
 
     // ---- a window: T tokens at positions pos .. pos + T - 1 through every layer; the logits of its last `logits` rows
     bool step(int token, bool want_logits, std::string& err) {
+        // (Phase 8AL) STRATA_DS4_PROF=<start>[,<len>]: bracket decode steps in a CUDA profiler range so
+        // `nsys profile --capture-range=cudaProfilerApi` collects exactly those and nothing of the load.
+        static int prof_start = -2, prof_len = 2, prof_step = 0;
+        if (prof_start == -2) {
+            prof_start = -1;
+            if (const char* v = std::getenv("STRATA_DS4_PROF")) {
+                const int a = std::atoi(v);
+                const char* c = std::strchr(v, ',');
+                if (a >= 0) { prof_start = a; prof_len = c ? std::max(1, std::atoi(c + 1)) : 2; }
+            }
+            if (prof_start >= 0)
+                std::fprintf(stderr, "ds4: profiler range on: decode steps %d..%d\n", prof_start,
+                             prof_start + prof_len);
+        }
+        if (prof_start >= 0) {
+            if (prof_step == prof_start) cudaProfilerStart();
+            if (prof_step == prof_start + prof_len) cudaProfilerStop();
+            ++prof_step;
+        }
         main_at.store("a decode step", std::memory_order_relaxed);
         tok_ab_begin();
         const bool ok = forward(&token, 1, want_logits ? 1 : 0, err);
@@ -17878,7 +18171,7 @@ struct Model::Impl {
                 CK(cudaMemcpyAsync(sw, l.win, (size_t) g.win * win_rb(), cudaMemcpyDeviceToDevice, s));
                 if (wp.snap_t[i] > 0) ext_to_ring(c.ext, sw, p0, g.win, wp.snap_t[i], HD, s, nullptr);
             }
-            ext_to_ring(c.ext, l.win, p0, g.win, T, HD, s, nullptr);
+            ext_to_ring(c.ext, l.win, p0, g.win, T, HD, s, nullptr, undo_h() > 0 ? l.undo_ring : nullptr, undo_h());
         }
         const uint8_t* ckv = nullptr;
         const long long ss = (long long) o.max_context + 64;
@@ -17908,7 +18201,8 @@ struct Model::Impl {
                             CK(cudaMemcpyAsync(ssc + (size_t) sl * HD, sc, (size_t) HD * 4, cudaMemcpyDeviceToDevice, s));
                         }
                     }
-                    compress_win(c.ckr, c.cgr, l.c_kv, l.c_score, R, (int) p0, T, HD, l.c_norm, g.eps, c.latent, s);
+                    compress_win(c.ckr, c.cgr, l.c_kv, l.c_score, R, (int) p0, T, HD, l.c_norm, g.eps, c.latent, s,
+                                 undo_h() > 0 ? l.undo_kv : nullptr, undo_h() > 0 ? l.undo_sc : nullptr, undo_h());
                 }
             }
             const int clen_max = (int) ((p0 + T) / R);
@@ -21085,6 +21379,11 @@ struct Model::Impl {
         Dev& d = devs[(size_t) di];
         cudaSetDevice(d.id);
         cudaStream_t s = d.st;
+        {   // (8CC) publish the window's position once, before the layer loop (the first layer's ring and finishes read it)
+            static int64_t sp0;
+            sp0 = p0;
+            CK(cudaMemcpyAsync(d.pos_dev, &sp0, sizeof sp0, cudaMemcpyHostToDevice, s));
+        }
         const int D = g.dim, H = g.hc;
         bool started = false;
         std::vector<char> got(srcs.size(), 0);
@@ -21102,7 +21401,26 @@ struct Model::Impl {
                     init_pre(d.pre, T, s);
                 } else {
                     const Dev& a = devs[(size_t) L[(size_t) il - 1].dev];
-                    xfer_get(hand_xfer(a.hand, d, T, false), a.hand_flag, wp.win, s);
+                    const bool p2p = pipe_p2p && T == 1 && a.id != d.id;
+                    if (p2p) {
+                        int can = 0;
+                        if (cudaDeviceCanAccessPeer(&can, d.id, a.id) != cudaSuccess || !can) {
+                            err = "DS4_PIPE_P2P: peer access unavailable";
+                            return false;
+                        }
+                        cudaSetDevice(d.id);
+                        CK(cudaStreamWaitEvent(s, a.ev_out, 0));
+                        const size_t nh = (size_t) T * H * D * 4, np = (size_t) T * 8 * 4,
+                                     nk = (size_t) T * topk_stride() * 4, nc = (size_t) T * cand_stride() * 4;
+                        CK(cudaMemcpyPeerAsync(d.h, d.id, a.h, a.id, nh, s));
+                        CK(cudaMemcpyPeerAsync(d.pre, d.id, a.pre, a.id, np, s));
+                        CK(cudaMemcpyPeerAsync(d.topk, d.id, a.topk, a.id, nk, s));
+                        CK(cudaMemcpyPeerAsync(d.cand, d.id, a.cand, a.id, nc, s));
+                        std::fprintf(stderr, "ds4: DS4_PIPE_P2P active CUDA%d -> CUDA%d (%zu bytes)\n", a.id, d.id,
+                                     nh + np + nk + nc);
+                    } else {
+                        xfer_get(hand_xfer(a.hand, d, T, false), a.hand_flag, wp.win, s);
+                    }
                 }
             }
             // the compressed KV / index keys another group's source layer wrote this window
@@ -21135,7 +21453,20 @@ struct Model::Impl {
             if (!layer(L0, mi, p0, T, wp, err)) return false;
             if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, il, p0, T);
             const bool last = il + 1 == g.nl || L[(size_t) il + 1].grp != L0.grp;
-            if (last && mi == 0 && il + 1 < g.nl) xfer_put(hand_xfer(d.hand, d, T, true), d.hand_flag, wp.win, d.xcnt, s);
+            if (last && mi == 0 && il + 1 < g.nl) {
+                const Dev& next = devs[(size_t) L[(size_t) il + 1].dev];
+                const bool p2p = pipe_p2p && T == 1 && d.id != next.id;
+                if (p2p) {
+                    int can = 0;
+                    if (cudaDeviceCanAccessPeer(&can, d.id, next.id) != cudaSuccess || !can) {
+                        err = "DS4_PIPE_P2P: peer access unavailable";
+                        return false;
+                    }
+                    CK(cudaEventRecord(d.ev_out, s));
+                } else {
+                    xfer_put(hand_xfer(d.hand, d, T, true), d.hand_flag, wp.win, d.xcnt, s);
+                }
+            }
         }
         if (d.grp == devs[(size_t) head_dev].grp && !head_rows_dev(di, T, err)) return false;
         if (!idle_ev.empty()) {   // (its turn over: the expert cache's copies from here, copy_open)
@@ -21147,13 +21478,17 @@ struct Model::Impl {
 
     // a source's new cache rows (src on device `from`, bytes of them) to the same place of its other devices' copies,
     // through pinned memory: the copy out on the source's stream, each copy in on its device's stream after it
-    bool replicate(std::vector<uint8_t*>& copies, uint8_t* stage, cudaEvent_t ev, const uint8_t* src, size_t at,
-                   size_t bytes, int from, std::string& err) {
+    bool replicate(std::vector<uint8_t*>& copies, uint8_t* stage, cudaEvent_t ev, const uint8_t* src, size_t rb,
+                   size_t at, size_t bytes, int from, std::string& err) {
         bool any = false;
         for (size_t od = 0; od < devs.size(); ++od) any = any || (copies[od] != nullptr && (int) od != from);
         if (!any) return true;
         Dev& d = devs[(size_t) from];
-        CK(cudaMemcpyAsync(stage, src, bytes, cudaMemcpyDeviceToHost, d.st));
+        // (8CC) the source's row offset (g_first) is read from the plan buffer on the device, so the staged copy's
+        // source pointer is stable (capture-ready): gather src + g_first * rb into d.rep_stage, then copy out.
+        if (bytes > 0)
+            rep_gather(d.rep_stage, src, d.ng_dev + 1, rb, bytes, d.st);
+        CK(cudaMemcpyAsync(stage, d.rep_stage, bytes, cudaMemcpyDeviceToHost, d.st));
         CK(cudaEventRecord(ev, d.st));
         for (size_t od = 0; od < devs.size(); ++od) {
             if (copies[od] == nullptr || (int) od == from) continue;
@@ -21216,6 +21551,13 @@ struct Model::Impl {
             const int64_t g_first = p0 / R;              // the first group whose last position is >= p0
             const int64_t g_end = (p0 + T) / R;          // groups completed by p0 + T - 1
             const int ng = (int) std::max<int64_t>(0, g_end - g_first);
+            {   // (8BQ) publish the window's shape and position for the graph port. These are function statics: a
+                // captured memcpy node needs a source address that does not move between replays.
+                static int stable[2];          // (8BQ) ng_dev is 2 ints (8 B): int64 here overflowed the allocation
+                stable[0] = ng;
+                stable[1] = (int) g_first;
+                CK(cudaMemcpyAsync(d.ng_dev, stable, sizeof stable, cudaMemcpyHostToDevice, s));
+            }
             if (l.kv_src) {
                 if (R == 1) {
                     Finish fc;
@@ -21265,7 +21607,11 @@ struct Model::Impl {
                             CK(cudaMemcpyAsync(rows + (size_t) kWin * HD, cgr, nr, cudaMemcpyDeviceToDevice, s));
                         }
                     }
-                    compress_win(ckr, cgr, A.c_kv, A.c_score, R, (int) p0, T, HD, l.c_norm, g.eps, d.latent, s);
+                    // (the undo log tracks the bound conversation's committed writes only: not a verify window, and
+                    //  A.c_kv == l.c_kv - the bound conversation's partial, not a parked conversation's)
+                    const bool undo_comp = !spec_win && undo_h() > 0 && A.c_kv == l.c_kv;
+                    compress_win(ckr, cgr, A.c_kv, A.c_score, R, (int) p0, T, HD, l.c_norm, g.eps, d.latent, s,
+                                 undo_comp ? l.undo_kv : nullptr, undo_comp ? l.undo_sc : nullptr, undo_h(), d.pos_dev);
                 }
             }
             Rows lim;
@@ -21277,8 +21623,34 @@ struct Model::Impl {
             }
             if (l.ix_src) {
                 Src& ks = srcs[(size_t) l.ik_src];
-                if (l.owns_k && ng > 0) {
-                    if (!mv(d, {job(l.i_wk, d.latent, d.ikr, ng, HD, g.ix_hd)}, err)) return false;
+                // Optional single-token shortcut: when every currently
+                // compressed position is selected, scores and top-k ranking
+                // cannot change the selected set. Candidate-restricted
+                // layers keep the original path.
+                static const bool index_all_fast = [] {
+                    const char* v = std::getenv("DS4_INDEX_ALL_FAST");
+                    return v != nullptr && std::atoi(v) != 0;
+                }();
+                static const bool index_query_skip = [] {
+                    const char* v = std::getenv("DS4_INDEX_QUERY_SKIP");
+                    return v != nullptr && std::atoi(v) != 0;
+                }();
+                const bool skip_query = index_all_fast && index_query_skip && T == 1 && !l.uses_cand &&
+                                        lim.n[0] <= g.ix_topk;
+                static const bool cand_all_fast = [] {
+                    const char* v = std::getenv("DS4_INDEX_CAND_ALL_FAST");
+                    return v != nullptr && std::atoi(v) != 0;
+                }();
+                const int avail_blocks = g.cand_blk > 0 ? (lim.n[0] + g.cand_blk - 1) / g.cand_blk : 0;
+                const bool cand_all = cand_all_fast && T == 1 && l.cand_src && !l.uses_cand &&
+                                      lim.n[0] <= g.ix_topk && avail_blocks <= g.cand_topk;
+                // (8BQ) shape-stable on the DECODE path only (a window: T <= kWin, ng <= 9, and the GEMV's
+                // column bound is NC <= 16). Prefill keeps the old guard and the old sizes exactly - padding a
+                // chunk's row count past NC is what made 8BT's attempt crawl.
+                const bool pad_ok = T <= kWin;
+                const int ng_max_i = pad_ok ? std::min(16, (int) ((T + R - 1) / R) + 1) : ng;
+                if (l.owns_k && (pad_ok || ng > 0)) {
+                    if (!mv(d, {job(l.i_wk, d.latent, d.ikr, pad_ok ? ng_max_i : ng, HD, g.ix_hd)}, err)) return false;
                     Finish fi;
                     fi.w = l.ik_norm;
                     fi.eps = g.eps;
@@ -21287,17 +21659,25 @@ struct Model::Impl {
                     fi.pos_step = R;
                     fi.freqs = freqs;
                     fi.quant = 3;
-                    fi.pdst = (*A.ik)[(size_t) l.dev] + (size_t) g_first * ik_rb();
+                    fi.pdst = (*A.ik)[(size_t) l.dev];   // (8BX) offset from the plan buffer
                     fi.pdst_stride = (long long) ik_rb();
-                    finish(d.ikr, ng, g.ix_hd, g.ix_hd, fi, s);
+                    fi.off_stride = (long long) ik_rb();
+                    fi.p0_dev = d.pos_dev;   // (8CC) g_first = p0/R, ng = (p0+T)/R - p0/R on the device
+                    fi.T = T;
+                    finish(d.ikr, pad_ok ? ng_max_i : ng, g.ix_hd, g.ix_hd, fi, s);   // (8BQ) masked past ng on the decode path
                     // (the pinned stage at the run's own rows: a multi step's runs replicate one after another, and
                     //  the next run's copy out must not overwrite rows another device has not copied in yet)
-                    if (!wp.par && !replicate((*A.ik), ks.h_ik + (size_t) r0 * ik_rb(), ks.ev_ik, fi.pdst,
+                    if (!wp.par && !replicate((*A.ik), ks.h_ik + (size_t) r0 * ik_rb(), ks.ev_ik, fi.pdst, ik_rb(),
                                               (size_t) g_first * ik_rb(),
                                               (size_t) ng * ik_rb(), l.dev, err))
                         return false;
                 }
-                if (clen_max > 0) {
+                if (skip_query) {
+                    // The all-position path needs only the positional index;
+                    // index-query projections and score/rank work have no
+                    // remaining consumer. Index-key generation above stays.
+                    iota_rows(topk_r, T, lim.n[0], (int) topk_stride(), s);
+                } else if (clen_max > 0) {
                     if (!mv(d, {job(l.i_wq_b, qr, d.iq, T, g.q_lora, (size_t) g.ix_heads * g.ix_hd)}, err)) return false;
                     Finish fi;
                     fi.rd = g.rd;
@@ -21313,7 +21693,12 @@ struct Model::Impl {
                     bool restrict_ = false;
                     for (int t = 0; t < T; ++t)
                         restrict_ = restrict_ || (lim.n[t] + g.cand_blk - 1) / g.cand_blk > g.cand_topk;
-                    if (l.uses_cand && restrict_) {
+                    if (cand_all) {
+                        iota_rows(cand_r, T, avail_blocks, (int) cand_stride(), s);
+                        iota_rows(topk_r, T, lim.n[0], (int) topk_stride(), s);
+                    } else if (index_all_fast && T == 1 && !l.uses_cand && lim.n[0] <= g.ix_topk) {
+                        iota_rows(topk_r, T, lim.n[0], (int) topk_stride(), s);
+                    } else if (l.uses_cand && restrict_) {
                         Rows cl;   // the candidate positions of each query: its blocks x blk
                         int nmax = 0;
                         for (int t = 0; t < T; ++t) {
@@ -21367,31 +21752,44 @@ struct Model::Impl {
                     }
                 }
             }
-            if (l.kv_src && ng > 0) {
+            if (l.kv_src) {   // (8BQ) unconditional at ng_max, masked on the device: the launch set no longer
+                              // depends on the position, which is what capture needs. Masked rows write nothing,
+                              // so the result is bit-identical.
+                const int ng_max = (int) ((T + R - 1) / R) + 1;   // from T and R alone, never from p0
                 Finish fc;
                 fc.rd = g.rd;
                 fc.pos = (int) (g_first * R);
                 fc.pos_step = R;
                 fc.freqs = freqs;
                 fc.quant = 2;
-                fc.pdst = (*A.ckv)[(size_t) l.dev] + (size_t) g_first * ckv_rb();
+                fc.pdst = (*A.ckv)[(size_t) l.dev];   // (8BX) the row offset now comes from the plan buffer
                 fc.pdst_stride = (long long) ckv_rb();
-                finish(d.latent, ng, HD, HD, fc, s);
-                if (!wp.par && !replicate((*A.ckv), sr.h_ckv + (size_t) r0 * ckv_rb(), sr.ev_ckv, fc.pdst,
+                fc.off_stride = (long long) ckv_rb();
+                fc.p0_dev = d.pos_dev;   // (8CC) g_first = p0/R, ng = (p0+T)/R - p0/R on the device
+                fc.T = T;
+                finish(d.latent, ng_max, HD, HD, fc, s);
+                if (!wp.par && !replicate((*A.ckv), sr.h_ckv + (size_t) r0 * ckv_rb(), sr.ev_ckv, fc.pdst, ckv_rb(),
                                           (size_t) g_first * ckv_rb(),
                                           (size_t) ng * ckv_rb(), l.dev, err))
                     return false;
                 if (wp.par && wp.nrow == 0 && mi == 0 && sr.remote) {   // the new rows for the other groups' readers
+                    // (8CC) the sources' g_first row offsets come from the plan buffer on the device, so the hand-off's
+                    // pointers are stable (capture-ready): gather the new ckv and index-key rows into d.rep_stage.
                     Xfer x;
-                    x.src[0] = fc.pdst;
+                    x.src[0] = d.rep_stage;
                     x.dst[0] = sr.x_stage;
                     x.bytes[0] = (size_t) ng * ckv_rb();
                     x.n = 1;
+                    if (ng > 0)
+                        rep_gather(d.rep_stage, fc.pdst, d.ng_dev + 1, ckv_rb(), (size_t) ng * ckv_rb(), s);
                     if (l.owns_k && (*A.ik)[(size_t) l.dev] != nullptr) {
-                        x.src[1] = (*A.ik)[(size_t) l.dev] + (size_t) g_first * ik_rb();
+                        x.src[1] = d.rep_stage + (size_t) kWin * ckv_rb();
                         x.dst[1] = sr.x_stage + x_cap() * ckv_rb();
                         x.bytes[1] = (size_t) ng * ik_rb();
                         x.n = 2;
+                        if (ng > 0)
+                            rep_gather(d.rep_stage + (size_t) kWin * ckv_rb(), (*A.ik)[(size_t) l.dev], d.ng_dev + 1,
+                                       ik_rb(), (size_t) ng * ik_rb(), s);
                     }
                     xfer_put(x, sr.x_flag, wp.win, d.xcnt, s);
                 }
@@ -21418,7 +21816,7 @@ struct Model::Impl {
         // the window rows: the ring's (positions p0 - win ..) then this window's, each query its own 128.  A DSpark
         // block's ring holds the trunk's main KV (positions <= p0 - 1, seeded); its block of drafts attends to all of
         // that ring and to the whole block, and leaves the ring as it was
-        ring_to_ext(A.win, d.ext, l.mtp ? (int64_t) g.win : p0, g.win, HD, s);   // (a block's ring: its rows as they lie)
+        ring_to_ext(A.win, d.ext, l.mtp ? (int64_t) g.win : p0, g.win, HD, s, l.mtp ? nullptr : d.pos_dev);   // (a block's ring: its rows as they lie)
         Finish fk;
         fk.w = l.kv_norm;
         fk.eps = g.eps;
@@ -21429,7 +21827,9 @@ struct Model::Impl {
         fk.dst = d.ext + (size_t) g.win * HD;
         fk.dst_stride = HD;
         finish(kvr, T, HD, HD, fk, s);
-        if (!l.mtp) ext_to_ring(d.ext, A.win, p0, g.win, T, HD, s, spec_win ? l.ring_bak + (size_t) r0 * win_rb() : nullptr);
+        if (!l.mtp)
+            ext_to_ring(d.ext, A.win, p0, g.win, T, HD, s, spec_win ? l.ring_bak + (size_t) r0 * win_rb() : nullptr,
+                        !spec_win && undo_h() > 0 ? l.undo_ring : nullptr, undo_h(), d.pos_dev);
         AttnRows ar;
         for (int t = 0; t < T; ++t) {
             if (l.mtp) {
@@ -21446,6 +21846,13 @@ struct Model::Impl {
         const void* ckv = nullptr;
         int ckv_fmt = kKvFp4;
         if (!attn_sel(l, mi, d, p0, T, r0, wp, A, err, snap, ar.nsel, ckv)) return false;
+        static const bool index_direct_gather = [] {
+            const char* v = std::getenv("DS4_INDEX_DIRECT_GATHER");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        if (index_direct_gather && std::getenv("DS4_INDEX_ALL_FAST") != nullptr && T == 1 && l.ix_src &&
+            !l.cand_src && l.ratio > 0 && (p0 + 1) / l.ratio <= g.ix_topk)
+            ar.direct = 1;
         if (l.mtp) {   // the block's rows (BF16), after the ring's in ext, as every query's selection
             ckv = d.ext + (size_t) g.win * HD;
             ckv_fmt = kKvBf16;
@@ -21479,10 +21886,13 @@ struct Model::Impl {
         const float* freqs = l.ratio ? d.freqs_comp : d.freqs_win;
         RingRuns rr;
         rr.runs = mp.nrun;
+        rr.log_h = undo_h();
         for (int k = 0; k < mp.nrun; ++k) {
             const MaRun& u = mp.run[k];
             rr.ring[k] = attn_seq(L0, mi, u.seq).win;
             rr.bak[k] = spec_win ? l.ring_bak + (size_t) u.r0 * win_rb() : nullptr;
+            // (the undo log tracks the bound conversation's ring only; the parked ones rewind via a slot, not a log)
+            rr.log[k] = !spec_win && u.seq == sq_bound && undo_h() > 0 ? l.undo_ring : nullptr;
             rr.p0[k] = l.mtp ? (long long) g.win : (long long) u.p0;   // (a block's ring: its rows as they lie)
             rr.e0[k] = u.e0;
             rr.T[k] = u.n;
@@ -21925,7 +22335,14 @@ struct Model::Impl {
                     m2.plan_ptr = LD.plan2;
                     gg::moe_gate_up(m2, d.x, d.xg, s);
                 }
-                if ((lead || lane_m) && !zc_nowait) wait_seq(&resps[slot].seq, sq, s);
+                // (Phase 8AM) STRATA_DS4_NO_LANE_WAIT=1 drops the lead device's per-layer wait on the CPU
+                // lane's response sequence. Experiment: is that wait on the critical path? (it is issued
+                // unconditionally on the GGUF/TP path, where lane_class() is always -1)
+                static const bool no_lane_wait = [] {
+                    const char* v = std::getenv("STRATA_DS4_NO_LANE_WAIT");
+                    return v != nullptr && std::atoi(v) != 0;
+                }();
+                if ((lead || lane_m) && !zc_nowait && !no_lane_wait) wait_seq(&resps[slot].seq, sq, s);
                 prof_mark(d, 4);
                 if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
                 else x3::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
@@ -22047,7 +22464,7 @@ struct Model::Impl {
                     return false;
                 }
                 ++pr[e];
-                l.heat[(size_t) e] += 1.0f;
+                l.heat[(size_t) e] += heat_scored() ? h_w[t * kPicks + i] * (float) l.k_exp : 1.0f;
                 if (l.slot[(size_t) e] < 0) l.cpu_hits.push_back(e);
                 if (held_out(l, e)) ++st.lend_picks;   // (its slot under a prompt's kept room)
                 per[(size_t) e].push_back({t, i});
@@ -22404,6 +22821,7 @@ struct Model::Impl {
             lp_pick(lg, m + 1, tk, r.p0 + 1, &q.toks);
         }
         rollback_run(i, m + 1);
+
         bool ok = true;
         if (g.n_mtp > 0) {
             seq_point(r.seq, true);
@@ -22423,9 +22841,38 @@ struct Model::Impl {
     }
 
     // rollback() for a multi step's verify window (parked: its conversation's state in sqs): its first `keep` rows kept
+    // undo_commit_single for a multi step's verify window (run i in mruns): the run's sequence's undo buffers, its
+    // window's own ring backups (r.r0 in) and raw rows, and the compressor's snapshot run i.
+    void undo_commit_run(int i, int keep) {
+        const MRun& r = mruns[(size_t) i];
+        const SeqState& q = sqs[(size_t) r.seq];
+        const int uh = undo_h();
+        std::vector<UndoCommitBatch> cb(devs.size());
+        for (int il = 0; il < g.nl; ++il)
+            for (int mi = 0; mi < L[(size_t) il].nm; ++mi) {
+                Layer& l = member(L[(size_t) il], mi);
+                const size_t k = (size_t) sq_base[(size_t) il] + (size_t) mi;
+                if (q.undo_ring[k] == nullptr && q.undo_kv[k] == nullptr) continue;
+                UndoCommitBatch& b = cb[(size_t) l.dev];
+                b.undo_ring[b.n] = q.undo_ring[k];
+                b.ring_bak[b.n] = l.ring_bak + (size_t) r.r0 * win_rb();
+                b.undo_kv[b.n] = q.undo_kv[k];
+                b.undo_sc[b.n] = q.undo_sc[k];
+                b.snap[b.n] = l.c_snap ? l.c_snap + (size_t) i * 2 * (size_t) l.ratio * g.hd : nullptr;
+                b.kv_rows[b.n] = l.c_rows ? l.c_rows + (size_t) r.r0 * g.hd : nullptr;
+                b.sc_rows[b.n] = l.c_rows ? l.c_rows + (size_t) r.r0 * g.hd + (size_t) kWin * g.hd : nullptr;
+                b.ratio[b.n++] = l.ratio;
+            }
+        for (size_t di = 0; di < devs.size(); ++di)
+            if (cb[di].n > 0) {
+                cudaSetDevice(devs[di].id);
+                undo_commit_batch(cb[di], r.p0, keep, uh, g.hd, devs[di].st);
+            }
+    }
     void rollback_run(int i, int keep) {
         const MRun& r = mruns[(size_t) i];
         SeqState& q = sqs[(size_t) r.seq];
+        if (undo_h() > 0 && keep > 0) undo_commit_run(i, keep);   // log the accepted spec rows for restore()
         if (keep < r.n) {
             std::vector<RingBatch> rb(devs.size());
             std::vector<CompBatch> cb(devs.size());

@@ -1210,6 +1210,31 @@ __global__ void __launch_bounds__(kThreads) mv_kernel(const Jobs J) {
     float acc[NC];
 #pragma unroll
     for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+    // Fast path for the common full-width IQ1_M GEMV.  The dispatch uses
+    // NC=16 for the production path and ncol is normally exactly 16; avoid
+    // carrying the per-column bounds predicate through every quantized block.
+    if constexpr (NC == 16) {
+        if (b.ncol == 16) {
+            for (int kb = lane; kb < nsb; kb += 32) {
+                Sub s;
+                decode<T>(w, kb, tab, s);
+#pragma unroll
+                for (int c = 0; c < 16; ++c) {
+                    const int4* xp = (const int4*) (b.xq + (size_t) c * b.k + (size_t) kb * 32);
+                    if constexpr (T == kQ6_K)
+                        acc[c] = fmaf(__ldg(b.xd + (size_t) c * nsb + kb), sub_dot<T>(s, __ldg(xp), __ldg(xp + 1)), acc[c]);
+                    else
+                        acc[c] = fmaf(b.xd[(size_t) c * nsb + kb], sub_dot<T>(s, xp[0], xp[1]), acc[c]);
+                }
+            }
+#pragma unroll
+            for (int c = 0; c < 16; ++c) {
+                const float v = warp_sum(acc[c]);
+                if (lane == 0) b.y[c * b.ycs + row] = b.alpha * v + (b.bias != nullptr ? b.bias[row] : 0.0f);
+            }
+            return;
+        }
+    }
     for (int kb = lane; kb < nsb; kb += 32) {
         Sub s;
         decode<T>(w, kb, tab, s);
@@ -1217,7 +1242,10 @@ __global__ void __launch_bounds__(kThreads) mv_kernel(const Jobs J) {
         for (int c = 0; c < NC; ++c)
             if (c < b.ncol) {
                 const int4* xp = (const int4*) (b.xq + (size_t) c * b.k + (size_t) kb * 32);
-                acc[c] = fmaf(b.xd[(size_t) c * nsb + kb], sub_dot<T>(s, xp[0], xp[1]), acc[c]);
+                if constexpr (T == kQ6_K)
+                    acc[c] = fmaf(__ldg(b.xd + (size_t) c * nsb + kb), sub_dot<T>(s, __ldg(xp), __ldg(xp + 1)), acc[c]);
+                else
+                    acc[c] = fmaf(b.xd[(size_t) c * nsb + kb], sub_dot<T>(s, xp[0], xp[1]), acc[c]);
             }
     }
 #pragma unroll

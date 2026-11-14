@@ -148,6 +148,11 @@ struct Stats {
     int64_t ahead_cold = 0, ahead_cold_hit = 0, ahead_pf = 0;
     int64_t ahead_rank_n[16] = {}, ahead_rank_hit[16] = {};   // the next-layer guesses by rank, and how many were picked
     int64_t drafts_offered = 0, drafts_accepted = 0, drafts_rounds = 0;
+    // DS4_UNDO_LOG (Phase 8BL-8BN): restores that rewound from the log (hits), the tokens they reused (the kept
+    // prefix = the limit), the tokens the log rewound (pos - limit), and restores the log declined (misses).
+    // Cumulative since engine start; the serve's Monitor boxes read them off the STAT line and split slot reuse = total
+    // reused - undo_reused.
+    int64_t undo_hits = 0, undo_reused = 0, undo_rewound = 0, undo_misses = 0;
     // per draft position (the 1st .. 8th of a round): verified with all the drafts before it accepted, and accepted
     int64_t draft_reached[8] = {}, draft_kept[8] = {};
     double draft_ms = 0.0, verify_ms = 0.0;   // the drafter's time, the verification windows' time
