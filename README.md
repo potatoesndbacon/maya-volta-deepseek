@@ -1,7 +1,7 @@
 # This fork serves as a one-off checkpoint of kernel optimizations and other changes to improve V100 performance with Deepseek V4.1 Flash 1017 that I wanted to share, I do not intend to maintain this.
 ## It is EXTREMELY important to contribute or PR to upstream if you want to extend on optimizations or want to push some ideas up to upstream.
 
-For the original information card of the main project, [click here](https://github.com/mw00/project-maya).
+For the original information card of the main project, [click here](https://github.com/mw00/project-maya). Credits and thank you to [mw00](https://github.com/mw00) for making a good base for me and Deepseek to work on for this.
 
 This checkpoint is made to get the most performance possible out of Maya, Volta and Deepseek without hurting quality or changing numerics much on outputs.
 For that reason, top-k head pruning and expert tail skipping is not used, though can be a toggled option for even more speed, it hurts quality notably though.
