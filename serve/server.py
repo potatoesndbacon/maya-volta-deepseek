@@ -3327,7 +3327,18 @@ class Service:
                                                "cpu", "ram", "disk_mb", "engram_ms")}}   # (the last four: DeepSeek's)
         hw = dict(tel["now"])
         cards = hw.pop("vram", None)                      # (each card's processes: for the GPU map only)
+        # prefill reuse, split: the undo log's share (DS4_UNDO_LOG, from the engine's STAT counters) vs the slot cache /
+        # shared prefix (the rest of totals.reused).  undo_reused is the kept prefix of each rewind; slot_reused is the
+        # remainder - the tokens a continuation, a kept conversation or a shared start reused.
+        st = stat or {}
+        undo_reused = int(st.get("undo_reused", 0) or 0)
+        reuse = {"reused": totals.get("reused", 0), "undo_reused": undo_reused,
+                 "undo_rewound": int(st.get("undo_rewound", 0) or 0),
+                 "undo_hits": int(st.get("undo_hits", 0) or 0),
+                 "undo_misses": int(st.get("undo_misses", 0) or 0),
+                 "slot_reused": max(0, totals.get("reused", 0) - undo_reused)}
         return {"engine": engine, "live": live, "tiers": tiers, "gpu_map": self._gpu_map(cards),
+                "reuse": reuse,
                 "requests": hist[::-1][:None if all_requests else 12],
                 "requests_kept": len(hist), "totals": totals, "loop_guard": guard, "hardware": hw,
                 "hardware_static":
@@ -6206,6 +6217,9 @@ def make_handler(svc: Service):
                 if path == "/api/tokens":                    # the context meter: a prompt's size, nothing run
                     self._json(200, svc.count_tokens(req))
                     return
+                if path == "/v1/sweep":                      # one resident prefix, N tails: the undo log's regime
+                    self._sweep(req)
+                    return
                 if path == "/tokenize":                      # llama.cpp's and vLLM's: a text's or a prompt's ids
                     self._json(200, svc.tokenize(req))
                     return
@@ -6521,6 +6535,68 @@ def make_handler(svc: Service):
                 emb = getattr(svc.embeddings, "path", None)
                 if emb:
                     Path(emb).unlink(missing_ok=True)
+
+        def _chat_once(self, req):
+            """One non-streaming chat completion's full response dict.  The same steps _openai takes for a non-stream
+            request (openai_chunks -> openai_collect), so prefix reuse - the slot cache and the undo log - behaves
+            exactly as it does for a normal request.  Used by /v1/sweep to issue N tails against one live prefix."""
+            req = svc.with_shared(req, "openai")
+            req["_api"] = "openai"
+            svc.check_request(req)
+            messages, tools, kw = openai_to_messages(req, deepseek=getattr(svc.template, "deepseek", False),
+                                                     glm_dsa=getattr(svc.template, "glm_dsa", False))
+            max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, guard=svc._loop_guard_on(req))
+            req = {**req, "_blocked": kw.get("_blocked"), "_think_resume": kw.get("_think_resume")}
+            req = {**req, "_think_max": kw.get("_think_max")}
+            cancel = threading.Event()
+            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel)
+            try:
+                return openai_collect(chunks)
+            finally:
+                chunks.close()
+
+        def _sweep(self, req):
+            """POST /v1/sweep {prefix, tails[], max_tokens, temperature}: read one long prefix once, then answer each
+            tail against it.  Requests 2..N share the prefix with the live state, so the engine rewinds the previous
+            tail through the undo log (DS4_UNDO_LOG) instead of re-reading the prefix - the workload the log exists
+            for, at N>2.  Returns per-tail usage/reuse and the run's undo counters; the log is earning its keep when
+            undo.reused is a large share of the prefix (the 'ton' regime of MAYA-UNDO-LOG-USES section 11)."""
+            try:
+                prefix = str(req.get("prefix") or "")
+                tails = req.get("tails") or []
+                if not prefix or not isinstance(tails, list) or not tails:
+                    raise ValueError("send a non-empty 'prefix' and a non-empty 'tails' list")
+                model = req.get("model") or svc.model
+                max_tokens = int(req.get("max_tokens") or 32)
+                temperature = float(req.get("temperature") or 0.0)
+            except (TypeError, ValueError) as e:
+                self._json(400, error_body(e))
+                return
+            keys = ("undo_hits", "undo_misses", "undo_reused", "undo_rewound")
+            def counters():
+                st = getattr(svc.engine, "stat", None) or {}
+                return {k: int(st.get(k, 0) or 0) for k in keys}
+            u0 = counters()
+            rows = []
+            for i, tail in enumerate(tails):
+                r = {"model": model, "messages": [{"role": "user", "content": prefix + "\n" + str(tail)}],
+                     "max_tokens": max_tokens, "temperature": temperature, "stream": False}
+                t0 = time.monotonic()
+                try:
+                    out = self._chat_once(r)
+                except Exception as e:                     # one bad tail must not end the sweep
+                    rows.append({"i": i, "error": f"{type(e).__name__}: {e}"})
+                    continue
+                u = out.get("usage") or {}
+                pd = u.get("prompt_tokens_details") or {}
+                rows.append({"i": i, "prompt_tokens": u.get("prompt_tokens"),
+                             "cached_tokens": pd.get("cached_tokens"),
+                             "completion_tokens": u.get("completion_tokens"),
+                             "wall_s": round(time.monotonic() - t0, 3)})
+            u1 = counters()
+            self._json(200, {"model": model, "prefix_chars": len(prefix), "tails": len(tails), "rows": rows,
+                             "undo": {k: u1[k] - u0[k] for k in keys}})
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")

@@ -301,6 +301,8 @@ TOOL_WINDOW = 12        # the last this many tool calls since the user's last me
 TOOL_REPS = 3           # ... hold the last one (name, arguments and result the same) this many times: a loop
 TOOL_NUDGES = 3         # notes (tool_note) before the server stops running it: then the call itself is blocked
 TOOL_BLOCK = TOOL_REPS + TOOL_NUDGES - 1   # (made this many times: TOOL_NUDGES notes went by, unheeded)
+TOOL_REPS_ANY = int(os.environ.get("MAYA_LOOP_TOOL_REPS_ANY") or 6)    # ... made this many times in all: a loop
+TOOL_BLOCK_ANY = int(os.environ.get("MAYA_LOOP_TOOL_BLOCK_ANY") or 9)  # ... this many in all: the call itself blocked
 BLOCK_HEAT = 0.15       # each blocked attempt in one answer after the first: the temperature this much higher ...
 BLOCK_HEAT_MAX = 1.5    # ... up to this (off its track: the same call again and again is the model's surest path)
 
@@ -376,6 +378,27 @@ def _tool_calls(messages: list[dict]) -> list[tuple]:
     return calls
 
 
+def _all_tool_calls(messages: list[dict]) -> list[tuple]:
+    """(name, arguments) of every tool call the conversation holds, the user's own messages NOT resetting the count:
+    a client that re-sends the whole conversation each round (an agent loop) carries every call it has made."""
+    out, pending = [], []
+    for m in messages:
+        role = m.get("role")
+        if role == "assistant":
+            pending = [((c.get("function") or c).get("name"), args_key((c.get("function") or c).get("arguments")))
+                       for c in m.get("tool_calls") or []]
+        elif role == "tool" and pending:
+            out.append(pending.pop(0))
+        elif role == "user":
+            pending = []        # (a call whose result never came is not counted)
+    return out
+
+
+def _times_any(messages: list[dict], call: tuple) -> int:
+    """How often this (name, arguments) appears in the whole conversation, whatever each result said."""
+    return sum(1 for x in _all_tool_calls(messages) if x == call)
+
+
 def _times(window: list[tuple], c: tuple) -> int:
     """How often call c counts as made among `window`: with the same result - or, the calls just before it in a row
     (nothing else in between), with a result that differs only in numbers or garbled bytes (a check run again and
@@ -397,13 +420,25 @@ def tool_repeat(messages: list[dict]) -> ToolRepeat | None:
     results: is the last call one the model made TOOL_REPS times among its last TOOL_WINDOW since the user's last
     message, with the same arguments, and got the same result each time (_times)?  A command run again after an edit
     gives another result, a poll that finally changes another one too: neither counts."""
-    if not messages or messages[-1].get("role") != "tool":
+    if not messages:
         return None
     calls = _tool_calls(messages)
-    if not calls:
+    if calls and messages[-1].get("role") == "tool":
+        times = _times(calls[-TOOL_WINDOW:], calls[-1])
+        if times >= TOOL_REPS:
+            return ToolRepeat(str(calls[-1][0]), times)
+    # (8T.4) the same call again and again over the conversation, whatever its results said and wherever the user's
+    # own turns fall: a meta-tool whose error text changes never matches on the result, and one that a client wraps in
+    # a user message resets the windowed count above.  Only consulted while the model is still in the tool loop (the
+    # last message a tool result or the user's), never for a conversation that has moved on to a plain answer.
+    if messages[-1].get("role") not in ("tool", "user"):
         return None
-    times = _times(calls[-TOOL_WINDOW:], calls[-1])
-    return ToolRepeat(str(calls[-1][0]), times) if times >= TOOL_REPS else None
+    allc = _all_tool_calls(messages)
+    if not allc:
+        return None
+    last = allc[-1]
+    anyr = sum(1 for x in allc if x == last)
+    return ToolRepeat(str(last[0]), anyr) if anyr >= TOOL_REPS_ANY else None
 
 
 def tool_blocked(messages: list[dict]) -> dict[tuple[str, str], ToolRepeat]:
@@ -414,8 +449,17 @@ def tool_blocked(messages: list[dict]) -> dict[tuple[str, str], ToolRepeat]:
     out = {}
     for c in window:
         t = _times(window, c)
+        n = _times_any(messages, c[:2])
+        if n >= TOOL_BLOCK_ANY:
+            t = max(t, n)   # (8T.4: the same round, its results varying, past TOOL_NUDGES of its notes)
         if t >= TOOL_BLOCK and t > out.get(c[:2], ToolRepeat("", 0)).times:
             out[c[:2]] = ToolRepeat(str(c[0]), t)
+    # (8T.4) the whole conversation, for a client that puts its own turns between the rounds: the windowed count above
+    # then sees nothing at all, while every round it re-sends is still there
+    for call in set(_all_tool_calls(messages)):
+        n = _times_any(messages, call)
+        if n >= TOOL_BLOCK_ANY and n > out.get(call, ToolRepeat("", 0)).times:
+            out[call] = ToolRepeat(str(call[0]), n)
     return {(str(k[0]), k[1]): v for k, v in out.items()}
 
 
