@@ -86,3 +86,5 @@ with the tuned promotion settings, `DS4_CACHE_MARGIN=1.0` and `DS4_CACHE_BONUS=0
 
 For this model, the three-GPU result uses pipeline parallelism; TP3 does not
 load successfully. 
+
+Agents for install, read AGENTS.md.
