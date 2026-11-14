@@ -77,7 +77,7 @@ with the tuned promotion settings, `DS4_CACHE_MARGIN=1.0` and `DS4_CACHE_BONUS=0
 |---|---:|---:|---:|
 | 4, TP4 | 66.1 tok/s | 98.1 tok/s | 1,282 / 1,294 tok/s |
 | 3, PP3xTP1 | 44.5 tok/s | 67.7 tok/s | 720 / 719 tok/s |
-| 2, TP2 | 39.0 tok/s | 42.7 tok/s | Not measured |
+| 2, TP2 | 39.0 tok/s | 46.7 tok/s | Not measured |
 
 For this model, the three-GPU result uses pipeline parallelism; TP3 does not
 load successfully. 
