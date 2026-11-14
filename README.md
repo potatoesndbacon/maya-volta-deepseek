@@ -3,6 +3,9 @@
 
 For the original information card of the main project, [click here](https://github.com/mw00/project-maya).
 
+This checkpoint is made to get the most performance possible out of Maya, Volta and Deepseek without hurting quality or changing numerics much on outputs.
+For that reason, top-k head reductions and expert tail skipping is not used, though can be a toggled option for even more speed, it hurts quality notably though.
+
 ## Context-length performance snapshot
 
 Measured on a Proxmox VM with a Epyc 7452, 110gb of memory on the VM, four 150 W Tesla V100S GPUs with P2P TP4 passed through, stock DSpark, greedy
