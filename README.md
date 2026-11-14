@@ -5,7 +5,7 @@ For the original information card of the main project, [click here](https://gith
 
 ## Context-length performance snapshot
 
-Measured on four 150 W Tesla V100S GPUs with TP4, stock DSpark, greedy
+Measured on a Proxmox VM with a Epyc 7452, 110gb of memory on the VM, four 150 W Tesla V100S GPUs with P2P TP4 passed through, stock DSpark, greedy
 generation, and a 128-token output per request. The prompts were synthetic
 natural-language contexts with unique prefixes. Rates are tokens per second;
 each context/mode has one sample, so treat these as a workload snapshot rather
@@ -29,18 +29,17 @@ pair-wide window and are not the sum of A and B.
 | 524,288 | 801.8 | 73.8 | 379.2 / 378.4 | 755.8 | 19.7 / 52.3 | 39.3 |
 | 1,048,440 | 542.9 | 68.3 | 257.2 / 257.9 | 514.1 | 63.1 / 67.4 | 38.5 |
 
-The two-request test used a separate two-slot engine; its expert placement
-differed from the one-slot setup. Prefill aggregation spans the first request
-start through the later first output. Decode aggregation spans the first output
-through the later completion, so overlap and queue time affect both aggregates.
+The two-request test used expert placement that differed from the one-slot setup. 
+Prefill aggregation spans the first request start through the later first output. 
+Decode aggregation spans the first output through the later completion, so overlap and queue time affect both aggregates.
 
-## Undo log: faster edits when it has the needed history
+## Undo log: faster edits and faster prefill when on tail edits in context
 
 During generation, Maya keeps rolling attention-cache data. The undo log saves
 the cache entries that are about to be overwritten. If you revise the end of a
-prompt in the same live session, Maya can restore those saved entries and
+prompt in the same live session, Maya with an undo log can restore those saved entries and
 continue from the edit, instead of reading the unchanged prefix again. The
-current setting keeps up to 16,384 tokens of this history in pinned host memory.
+current setting rewinds up to 16,384 tokens from the tail in pinned host memory.
 It only helps when the requested rewind is covered by entries recorded in that
 live session. A conversation restored from a disk slot may not have matching
 undo history; then Maya falls back to its normal restore/recompute path.
