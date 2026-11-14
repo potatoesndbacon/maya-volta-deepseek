@@ -35,21 +35,6 @@ The two-request test used expert placement that differed from the one-slot setup
 Prefill aggregation spans the first request start through the later first output. 
 Decode aggregation spans the first output through the later completion, so overlap and queue time affect both aggregates.
 
-## Expert-cache warm-up and GPU-count measurements
-
-The expert swap cache learns which experts are being routed and moves frequently
-used experts into VRAM. In this checkpoint, the router ramps FAST and AGGRESSIVELY as much as it can without cache trashing,
-with the tuned promotion settings, `DS4_CACHE_MARGIN=1.0` and `DS4_CACHE_BONUS=0.25`.
-
-| GPUs and layout | Prose decode | Code decode | Prefill at 20K / 80K |
-|---|---:|---:|---:|
-| 4, TP4 | 66.1 tok/s | 98.1 tok/s | 1,282 / 1,294 tok/s |
-| 3, PP3xTP1 | 44.5 tok/s | 67.7 tok/s | 720 / 719 tok/s |
-| 2, TP2 | 39.0 tok/s | 42.7 tok/s | Not measured |
-
-For this model, the three-GPU result uses pipeline parallelism; TP3 does not
-load successfully. 
-
 ## Added an Undo Log: faster prefill for tail edits and repeated edits in context
 
 An Undo Log complements the slot prefix cache, helping further prefill savings. 
@@ -80,3 +65,19 @@ In order to ensure no cache discrepancy, the log records the old value of each c
 values in reverse logical order, so the ring and compressed-cache state match the earlier position. It also tracks which token positions
 are covered; if the requested rewind is outside that recorded range, it reports a miss and uses the normal fallback.
 
+Unset `DS4_UNDO_LOG` to disable.
+
+## Expert-cache warm-up and GPU-count measurements
+
+The expert swap cache learns which experts are being routed and moves frequently
+used experts into VRAM. In this checkpoint, the router ramps FAST and AGGRESSIVELY as much as it can without cache trashing,
+with the tuned promotion settings, `DS4_CACHE_MARGIN=1.0` and `DS4_CACHE_BONUS=0.25`.
+
+| GPUs and layout | Prose decode | Code decode | Prefill at 20K / 80K |
+|---|---:|---:|---:|
+| 4, TP4 | 66.1 tok/s | 98.1 tok/s | 1,282 / 1,294 tok/s |
+| 3, PP3xTP1 | 44.5 tok/s | 67.7 tok/s | 720 / 719 tok/s |
+| 2, TP2 | 39.0 tok/s | 42.7 tok/s | Not measured |
+
+For this model, the three-GPU result uses pipeline parallelism; TP3 does not
+load successfully. 
