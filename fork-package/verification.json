@@ -1,0 +1,11 @@
+{
+  "upstream_commit": "8b0a449c599fbb370a1dcc0979ae7c84d4310529",
+  "patch_sha256": "f2df4415010402f8683bf8a6894d97ecb8e246a403ace0f3f423556aba98297d",
+  "patch_applied_to_clean_upstream": true,
+  "changed_files_checked": 15,
+  "reconstructed_source_matches": 15,
+  "live_source_matches": 15,
+  "production_binary_sha256": "a0cc17c94e17e398f7053947f3f062214d1e2fb410196f1cb8331add8a24429a",
+  "binary_rebuild_performed": false,
+  "diff_check": "one pre-existing trailing-whitespace line in src/ds4/ds4_main.cpp:2556"
+}
