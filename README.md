@@ -33,6 +33,32 @@ The two-request test used expert placement that differed from the one-slot setup
 Prefill aggregation spans the first request start through the later first output. 
 Decode aggregation spans the first output through the later completion, so overlap and queue time affect both aggregates.
 
+## Expert-cache warm-up and GPU-count measurements
+
+The expert swap cache learns which experts are being routed and moves frequently
+used experts into VRAM. In a measured four-card TP4 cold-start probe with the
+cache enabled, the first 100 generated tokens ran at 37.9 tok/s; the next
+100-token windows measured 58.5, 58.1, and 52.1 tok/s. A second generation in
+the same process started at 62.8 tok/s. With the tuned promotion settings,
+`DS4_CACHE_MARGIN=1.0` and `DS4_CACHE_BONUS=0.25`, the recorded cold ramp was
+one slower window, about 0.9 seconds per process. Warm-process probes showed no
+first-window ramp.
+
+The separate GPU-count benchmark measured warmed decode on the same model and
+bias-0 expert-cache setup. These are steady-state measurements after a warm-up,
+not cold-start ramp measurements:
+
+| GPUs and layout | Prose decode | Code decode | Prefill at 20K / 80K |
+|---|---:|---:|---:|
+| 4, TP4 | 60.1 tok/s | 79.0 tok/s | 1,482 / 1,394 tok/s |
+| 3, PP3xTP1 | 44.5 tok/s | 48.7 tok/s | 720 / 719 tok/s |
+| 2, TP2 | 39.0 tok/s | 42.7 tok/s | Not measured |
+
+For this model, the three-GPU result uses pipeline parallelism; TP3 does not
+load successfully. The saved measurements show that the cache-enabled setup
+serves decode on two and three GPUs after warm-up, but do not include a
+first-window cache-ramp trace for those GPU counts.
+
 ## Added an Undo Log: faster prefill for tail edits and repeated edits in context
 
 An Undo Log complements the slot prefix cache, helping further prefill savings. 
