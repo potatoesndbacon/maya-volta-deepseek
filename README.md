@@ -1,3 +1,5 @@
+For the orginal information card of the main project, [click here](https://github.com/mw00/project-maya).
+
 <p align="center">English | <a href="README.ja.md">日本語</a> | <a href="README.zh-CN.md">简体中文</a> | <a href="README.pt-BR.md">Português</a></p>
 
 <p align="center"><img src="assets/maya-logo.png" width="128" alt="Maya logo"></p>
