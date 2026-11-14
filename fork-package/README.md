@@ -38,9 +38,9 @@ build to expose run-to-run drift.
 
 | Prompt | Production before | Fork build | Production after |
 |---|---:|---:|---:|
-| Code | 96.3 tok/s | 98.3 tok/s | 92.0 tok/s |
-| Prose | 67.5 tok/s | 66.9 tok/s | 68.2 tok/s |
-| Workflow | 83.2 tok/s | 84.0 tok/s | 81.8 tok/s |
+| Code | 96.3 tok/s | 98.3 tok/s | 
+| Prose | 67.5 tok/s | 66.9 tok/s | 
+| Workflow | 83.2 tok/s | 84.0 tok/s | 
 
 The fork was slightly faster than the first production run on code and workflow
 and slightly slower on prose. Production control rates drifted between runs;
