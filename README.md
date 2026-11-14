@@ -16,7 +16,7 @@ For two simultaneous requests, each request's rate is shown as `A / B`, followed
 by the measured aggregate rate in parentheses. Aggregate rates use the elapsed
 pair-wide window and are not the sum of A and B.
 
-
+# Recorded numbers on Unsloth DeepSeek-V4.1-Flash-1017-GGUF UD-IQ2_XXS, Weights 165.3gb, Engrams Q5_K / 135.2gb 
 | Prompt tokens | Concurrency 1 prefill | C1 decode | Concurrency 2 prefill A / B | C2 aggregate prefill | C2 decode A / B | C2 aggregate decode |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
 | 2,048 | 725.6 | 111.3 | 506.4 / 333.8 | 666.6 | 31.3 / 64.2 | 62.6 |
