@@ -16,15 +16,18 @@ For two simultaneous requests, each request's rate is shown as `A / B`, followed
 by the measured aggregate rate in parentheses. Aggregate rates use the elapsed
 pair-wide window and are not the sum of A and B.
 
-| Context | 1 request prefill | 1 request decode | 2 requests prefill A / B (aggregate) | 2 requests decode A / B (aggregate) |
-|---:|---:|---:|---:|---:|
-| 2K | 738.2 | 63.2 | 479.9 / 315.7 (630.1) | 25.9 / 43.9 (49.8) |
-| 8K | 1,145.2 | 72.5 | 592.6 / 687.7 (1,181.9) | 51.5 / 30.9 (57.8) |
-| 32K | 1,277.9 | 62.3 | 699.5 / 669.2 (1,336.7) | 27.0 / 51.0 (54.0) |
-| 64K | 1,275.1 | 70.8 | 602.8 / 616.2 (1,204.5) | 47.7 / 25.0 (49.8) |
-| 128K | 1,185.3 | 61.7 | 573.1 / 566.9 (1,133.0) | 24.9 / 50.1 (49.7) |
-| 256K | 1,027.6 | 61.6 | 492.5 / 494.4 (982.9) | 47.3 / 21.7 (43.3) |
-| 512K | 818.2 | 62.4 | 396.1 / 397.0 (791.5) | 38.4 / 18.5 (35.1) |
+
+| Prompt tokens | Concurrency 1 prefill | C1 decode | Concurrency 2 prefill A / B | C2 aggregate prefill | C2 decode A / B | C2 aggregate decode |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| 2,048 | 725.6 | 111.3 | 506.4 / 333.8 | 666.6 | 31.3 / 64.2 | 62.6 |
+| 8,192 | 1,123.9 | 88.7 | 586.3 / 679.9 | 1,169.3 | 75.8 / 31.0 | 62.1 |
+| 16,384 | 1,211.9 | 92.7 | 702.2 / 647.7 | 1,293.1 | 33.2 / 69.1 | 66.5 |
+| 32,768 | 1,255.2 | 112.9 | 607.9 / 633.0 | 1,213.7 | 63.9 / 31.5 | 60.7 |
+| 65,536 | 1,225.2 | 107.1 | 614.7 / 601.8 | 1,202.0 | 28.7 / 69.8 | 57.4 |
+| 131,072 | 1,142.9 | 89.8 | 565.0 / 571.0 | 1,129.1 | 67.9 / 29.2 | 57.7 |
+| 262,144 | 1,004.8 | 77.0 | 496.6 / 493.7 | 986.6 | 23.8 / 60.1 | 47.6 |
+| 524,288 | 801.8 | 73.8 | 379.2 / 378.4 | 755.8 | 19.7 / 52.3 | 39.3 |
+| 1,048,440 | 542.9 | 68.3 | 257.2 / 257.9 | 514.1 | 63.1 / 67.4 | 38.5 |
 
 The two-request test used a separate two-slot engine; its expert placement
 differed from the one-slot setup. Prefill aggregation spans the first request
