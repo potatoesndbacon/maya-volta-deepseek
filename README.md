@@ -48,6 +48,8 @@ continue from the edit, instead of reading the unchanged prefix again. The
 current setting rewinds up to 16,384 tokens from the tail in pinned host memory (about 2gb for 1 slot, 8gb for 4 slots).
 If the Undo Log misses after the slot prefix cache, Maya falls back to its normal prefill recompute path.
 
+In the Maya web interface, on the monitor page it will tell you how many prefill tokens are replayed by the undo log.
+
 Measured hit cases on the V100 production setup:
 
 - A 2.3K-token tail edit with production slots enabled reduced time to first
@@ -62,7 +64,7 @@ Measured hit cases on the V100 production setup:
   and no misses.
 
 It’s most useful for repeated iterative editing, prompt variants, evaluation suites, and other workloads that keep a long prefix and change only
-the ending. It may miss after restoring a conversation from a disk slot, since the undo history is in memory. 
+the ending. It may miss after restoring a conversation from a disk slot, since the undo history is in memory.  
 
 In order to ensure no cache discrepancy, the log records the old value of each cache slot immediately before the slot is overwritten. When rewinding, Maya restores those saved
 values in reverse logical order, so the ring and compressed-cache state match the earlier position. It also tracks which token positions
