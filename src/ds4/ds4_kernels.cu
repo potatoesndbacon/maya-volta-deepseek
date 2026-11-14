@@ -278,7 +278,7 @@ __device__ __forceinline__ void finish_vec(float* v, int len, const Finish& f, i
     }
     if (kPack) {   // the same roundings, written as their codes and each group's scale (the readers' q * s: r exactly)
         const int g = f.quant == 2 ? 16 : 32;
-        uint8_t* pr = f.pdst + vi * f.pdst_stride;
+        uint8_t* pr = f.pdst + (long long) f.off * f.off_stride + vi * f.pdst_stride;   // (8CC) g_first (finish_kernel)
 #pragma unroll
         for (int j = 0; j < kFinMax; ++j) {
             if (j >= nj) break;
@@ -340,8 +340,20 @@ template <bool kPack>
 __global__ void __launch_bounds__(kThreads) finish_kernel(float* x, int len, long long stride, Finish f) {
     pdl_wait();
     pdl_trigger();
+    // (8CC) g_first / ng from the window's position p0, but only for the packed (compressed) finishes that need them;
+    // the dense finishes read the rotary base directly and skip the integer divisions.
+    const bool packed = f.p0_dev != nullptr && f.pdst != nullptr;
+    const int g_first = packed ? (int) (*f.p0_dev / f.pos_step)
+                               : (f.off_dev != nullptr ? *f.off_dev : 0);
+    const int ng = packed ? (int) ((*f.p0_dev + f.T) / f.pos_step - *f.p0_dev / f.pos_step)
+                          : (f.n_dev != nullptr ? *f.n_dev : 0);
+    const bool masked = packed || f.n_dev != nullptr;
+    if (masked && blockIdx.x >= (unsigned) ng) return;
     const long long v = blockIdx.x;
-    finish_vec<kPack>(x + v * stride, len, f, f.rd > 0 ? f.pos + (int) (blockIdx.x / f.vpp) * f.pos_step : 0,
+    const int pbase = f.p0_dev != nullptr ? (f.pos_step > 1 ? g_first * f.pos_step : (int) *f.p0_dev)
+                                          : (f.pos_dev != nullptr ? (*f.pos_dev) * f.pos_step : f.pos);
+    f.off = g_first;   // finish_vec's packed destination offset
+    finish_vec<kPack>(x + v * stride, len, f, f.rd > 0 ? pbase + (int) (blockIdx.x / f.vpp) * f.pos_step : 0,
                       f.dst != nullptr ? f.dst + v * f.dst_stride : nullptr, v);
 }
 // (DS4_MULTI_ATTN) vector v is row v / vpp's: that row's position, its dst row (finish_rows)
@@ -957,18 +969,38 @@ __global__ void copy_regions_kernel(const CopyRegions r) {
     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x)
         d[i] = sr[i];
 }
+// (8CC) replicate's source gather: `bytes` bytes from src + (*g_first) * rb to dst, the source's row offset
+// read from device memory (the plan buffer's g_first) so no host pointer carries the position (capture-ready).
+__global__ void rep_gather_kernel(uint8_t* __restrict__ dst, const uint8_t* __restrict__ src,
+                                  const int* __restrict__ g_first, size_t rb, size_t bytes) {
+    const uint8_t* s = src + (size_t)(*g_first) * rb;
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < bytes;
+         i += (size_t) gridDim.x * blockDim.x)
+        dst[i] = s[i];
+}
 
 // ---------------------------------------------------------------- the compressor (ratio > 1), a window in order
 __global__ void __launch_bounds__(512) compress_kernel(const float* __restrict__ kv, const float* __restrict__ score,
                                                        float* kv_state, float* score_state, int ratio, int p0, int T,
                                                        int d, const float* __restrict__ w, float eps,
-                                                       float* __restrict__ latent) {
+                                                       float* __restrict__ latent,
+                                                       float* __restrict__ log_kv = nullptr,
+                                                       float* __restrict__ log_sc = nullptr, int log_h = 0,
+                                                       const int64_t* __restrict__ p0p = nullptr) {
     pdl_wait();
     pdl_trigger();
+    const int p = p0p != nullptr ? (int)(*p0p) : p0;   // (8CC) the window's position from the plan buffer when given
     int g = 0;
     for (int t = 0; t < T; ++t) {
-        const int slot = (p0 + t) % ratio;
-        const bool pool = (p0 + t + 1) % ratio == 0;
+        const int slot = (p + t) % ratio;
+        const bool pool = (p + t + 1) % ratio == 0;
+        if (log_kv != nullptr) {   // (the undo log, DS4_UNDO_LOG: the overwritten slot's old row, circular over log_h)
+            const size_t lr = (size_t) ((p + t) % log_h) * (size_t) d;
+            for (int e = threadIdx.x; e < d; e += blockDim.x) {
+                log_kv[lr + (size_t) e] = kv_state[(size_t) slot * d + e];
+                log_sc[lr + (size_t) e] = score_state[(size_t) slot * d + e];
+            }
+        }
         for (int e = threadIdx.x; e < d; e += blockDim.x) {
             kv_state[(size_t) slot * d + e] = kv[(size_t) t * d + e];
             score_state[(size_t) slot * d + e] = score[(size_t) t * d + e];
@@ -1825,7 +1857,7 @@ constexpr int kStage = 16;   // rows a pass stages (a thread: 32 values of one)
 // values part * 32 .. + 32 of a packed compressed row (kKvFp4, 512 values) as BF16 into dst[0 .. 4) (exact: the
 // values are E2M1 times an E4M3 scale)
 __device__ __forceinline__ void unpack32(const uint8_t* rr, int part, uint4* dst) {
-    const uint4 cw = *(const uint4*) (rr + part * 16);   // 32 codes, two scale groups
+    const uint4 cw = __ldg((const uint4*) (rr + part * 16));   // 32 codes, two scale groups
     const float k0 = e4m3_value(rr[256 + part * 2]) * 16384.0f, k1 = e4m3_value(rr[256 + part * 2 + 1]) * 16384.0f;
     const uint32_t wv[4] = {cw.x, cw.y, cw.z, cw.w};
     uint32_t o[16];
@@ -1860,7 +1892,8 @@ __global__ void __launch_bounds__(kThreads) unpack_sel_kernel(const uint8_t* __r
     }
     if (i >= n_sel) return;
     const size_t r = (size_t) t * cap + i;
-    unpack32(ckv + (size_t) sel[(size_t) t * sel_stride + i] * kv_row_bytes(kKvFp4, 512), part, (uint4*) (out + r * 512 + part * 32));
+    const int row = ar.direct ? i : sel[(size_t) t * sel_stride + i];
+    unpack32(ckv + (size_t) row * kv_row_bytes(kKvFp4, 512), part, (uint4*) (out + r * 512 + part * 32));
 }
 // (DS4_MULTI_ATTN) the same for rows of several conversations: row t's selection from its own cache c.ckv[t]
 __global__ void __launch_bounds__(kThreads) unpack_sel_rows_kernel(const AttnCkv c, const int* __restrict__ sel,
@@ -2446,8 +2479,9 @@ __device__ __forceinline__ void ring_row_to_ext(const uint8_t* __restrict__ ring
     for (int e = threadIdx.x; e < d; e += blockDim.x)
         dst[e] = p >= 0 ? f2bf16(e4m3_value(row[e]) * ue8m0_val(row[d + e / 32])) : (uint16_t) 0;
 }
-__global__ void ring_to_ext_kernel(const uint8_t* __restrict__ ring, uint16_t* __restrict__ ext, long long p0, int n,
+__global__ void ring_to_ext_kernel(const uint8_t* __restrict__ ring, uint16_t* __restrict__ ext, long long p0_arg, const int64_t* p0p, int n,
                                    int d) {
+    const long long p0 = p0p != nullptr ? (long long) *p0p : p0_arg;   // (8BX) device-read position when given
     pdl_wait();
     pdl_trigger();
     const int r = blockIdx.x;
@@ -2466,14 +2500,18 @@ __global__ void ring_to_ext_runs_kernel(const RingRuns rr, uint16_t* __restrict_
 // rounding's own scale, so each v / 2^k is that E4M3 value times a power of two >= 1, at most 448 - an E4M3 value again.
 // Row t of a window of T (src: its window buffer row), the ring's row it replaces to backup's row t first
 __device__ __forceinline__ void ext_row_to_ring(const uint16_t* __restrict__ src, uint8_t* __restrict__ ring,
-                                                long long p0, int n, int T, int t, int d, uint8_t* __restrict__ backup) {
+                                                long long p0, int n, int T, int t, int d, uint8_t* __restrict__ backup,
+                                                uint8_t* __restrict__ log = nullptr, int log_h = 0) {
     if (T - t > n) return;   // overwritten by a later row of the window anyway
     const size_t rb = kv_row_bytes(kKvFp8, d);
     uint8_t* row = ring + (size_t) ((p0 + t) % n) * rb;
     if (backup != nullptr) {
         for (size_t i = threadIdx.x; i < rb; i += blockDim.x) backup[(size_t) t * rb + i] = row[i];
-        __syncthreads();
     }
+    if (log != nullptr) {   // (the undo log, DS4_UNDO_LOG: the overwritten row at its own position, circular over log_h)
+        for (size_t i = threadIdx.x; i < rb; i += blockDim.x) log[(size_t) ((p0 + t) % log_h) * rb + i] = row[i];
+    }
+    if (backup != nullptr || log != nullptr) __syncthreads();
     for (int e0 = 0; e0 < d; e0 += blockDim.x) {   // (d a multiple of 32: a warp's 32 values one group)
         const int e = e0 + (int) threadIdx.x;
         const float v = e < d ? bf16f(src[e]) : 0.0f;
@@ -2486,12 +2524,14 @@ __device__ __forceinline__ void ext_row_to_ring(const uint16_t* __restrict__ src
     }
 }
 __global__ void __launch_bounds__(kThreads) ext_to_ring_kernel(const uint16_t* __restrict__ ext,
-                                                               uint8_t* __restrict__ ring, long long p0, int n, int T,
-                                                               int d, uint8_t* __restrict__ backup) {
+                                                               uint8_t* __restrict__ ring, long long p0_arg, const int64_t* p0p, int n, int T,
+                                                               int d, uint8_t* __restrict__ backup,
+                                                               uint8_t* __restrict__ log, int log_h) {
+    const long long p0 = p0p != nullptr ? (long long) *p0p : p0_arg;   // (8BX) device-read position when given
     pdl_wait();
     pdl_trigger();
     const int t = blockIdx.x;
-    ext_row_to_ring(ext + (size_t) (n + t) * d, ring, p0, n, T, t, d, backup);
+    ext_row_to_ring(ext + (size_t) (n + t) * d, ring, p0, n, T, t, d, backup, log, log_h);
 }
 // (DS4_MULTI_ATTN) block (t, k): run k's row t (past its rows: nothing)
 __global__ void __launch_bounds__(kThreads) ext_to_ring_runs_kernel(const RingRuns rr, const uint16_t* __restrict__ ext,
@@ -2500,18 +2540,21 @@ __global__ void __launch_bounds__(kThreads) ext_to_ring_runs_kernel(const RingRu
     pdl_trigger();
     const int t = blockIdx.x, k = blockIdx.y;
     if (t >= rr.T[k]) return;
-    ext_row_to_ring(ext + ((size_t) rr.e0[k] + n + t) * d, rr.ring[k], rr.p0[k], n, rr.T[k], t, d, rr.bak[k]);
+    ext_row_to_ring(ext + ((size_t) rr.e0[k] + n + t) * d, rr.ring[k], rr.p0[k], n, rr.T[k], t, d, rr.bak[k],
+                    rr.log[k], rr.log_h);
 }
 
-__global__ void ring_restore_kernel(uint8_t* __restrict__ ring, const uint8_t* __restrict__ backup, long long p0, int n,
+__global__ void ring_restore_kernel(uint8_t* __restrict__ ring, const uint8_t* __restrict__ backup, long long p0_arg, const int64_t* p0p, int n,
                                     int keep, size_t rb) {
+    const long long p0 = p0p != nullptr ? (long long) *p0p : p0_arg;   // (8BX) device-read position when given
     pdl_wait();
     pdl_trigger();
     const int t = keep + blockIdx.x;
     uint8_t* row = ring + (size_t) ((p0 + t) % n) * rb;
     for (size_t i = threadIdx.x; i < rb; i += blockDim.x) row[i] = backup[(size_t) t * rb + i];
 }
-__global__ void ring_restore_batch_kernel(const RingBatch b, long long p0, int n, int keep, size_t rb) {
+__global__ void ring_restore_batch_kernel(const RingBatch b, long long p0_arg, const int64_t* p0p, int n, int keep, size_t rb) {
+    const long long p0 = p0p != nullptr ? (long long) *p0p : p0_arg;   // (8BX) device-read position when given
     pdl_wait();
     pdl_trigger();
     const int t = keep + blockIdx.x, li = blockIdx.y;
@@ -2520,7 +2563,8 @@ __global__ void ring_restore_batch_kernel(const RingBatch b, long long p0, int n
     for (size_t i = threadIdx.x; i < rb; i += blockDim.x) row[i] = src[i];
 }
 
-__global__ void comp_restore_batch_kernel(const CompBatch b, long long p0, int keep, int d) {
+__global__ void comp_restore_batch_kernel(const CompBatch b, long long p0_arg, const int64_t* p0p, int keep, int d) {
+    const long long p0 = p0p != nullptr ? (long long) *p0p : p0_arg;   // (8BX) device-read position when given
     pdl_wait();
     pdl_trigger();
     const int li = blockIdx.x, R = b.ratio[li];
@@ -2861,7 +2905,7 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
                                                             const float* __restrict__ x, int dim, int* idx, float* w,
                                                             unsigned long long* plan_ptr, Req* req,
                                                             const float* __restrict__ bias_vl, unsigned vl,
-                                                            int* cpu_any, float rs_w, int rs_k) {
+                                                            int* cpu_any, float rs_w, int rs_k, float rs_b, float rs_btop) {
     pdl_wait();
     pdl_trigger();
     __shared__ float sc[1024], bs[1024];
@@ -2876,15 +2920,20 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
         const float l = logits[i];
         const float sp = l > 20.0f ? l : log1pf(expf(l));
         sc[i] = sqrtf(sp);
+        // (Phase 8T) the resident bias, and (8AB) a separate penalty for the first pick: applied a selection round at
+        // a time below, so the router's own top expert can be kept while the lower slots are held to VRAM.
         bs[i] = sc[i] + bias[i];
     }
     __syncthreads();
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
     for (int r = 0; r < k; ++r) {
+        const float fr = (r == 0) ? rs_btop : rs_b;
         float best = -FLT_MAX;
         int bix = 0x7fffffff;
-        for (int i = threadIdx.x; i < n; i += blockDim.x)
-            if (bs[i] > best || (bs[i] == best && i < bix)) best = bs[i], bix = i;
+        for (int i = threadIdx.x; i < n; i += blockDim.x) {
+            const float v = bs[i] - ((fr > 0.0f && vram != nullptr && vram[i] == 0ull) ? fr : 0.0f);
+            if (v > best || (v == best && i < bix)) best = v, bix = i;
+        }
         for (int o = 16; o > 0; o >>= 1) {
             const float ov = __shfl_xor_sync(0xffffffffu, best, o);
             const int oi = __shfl_xor_sync(0xffffffffu, bix, o);
@@ -2997,10 +3046,13 @@ __global__ void __launch_bounds__(512) route_pair_kernel(const RoutePair a) {
         __syncthreads();
         const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
         for (int r = 0; r < k; ++r) {
+            const float fr = (r == 0) ? a.rs_btop : a.rs_b;
             float best = -FLT_MAX;
             int bix = 0x7fffffff;
-            for (int i = threadIdx.x; i < n; i += blockDim.x)
-                if (bs[i] > best || (bs[i] == best && i < bix)) best = bs[i], bix = i;
+            for (int i = threadIdx.x; i < n; i += blockDim.x) {
+                const float v = bs[i] - ((fr > 0.0f && a.vram != nullptr && a.vram[i] == 0ull) ? fr : 0.0f);
+                if (v > best || (v == best && i < bix)) best = v, bix = i;
+            }
             for (int o = 16; o > 0; o >>= 1) {
                 const float ov = __shfl_xor_sync(0xffffffffu, best, o);
                 const int oi = __shfl_xor_sync(0xffffffffu, bix, o);
@@ -3313,6 +3365,12 @@ __device__ __forceinline__ float4 sat4(float4 v) {   // (FP16's range: a partial
     const float m = 65504.0f;
     return make_float4(fminf(fmaxf(v.x, -m), m), fminf(fmaxf(v.y, -m), m), fminf(fmaxf(v.z, -m), m), fminf(fmaxf(v.w, -m), m));
 }
+// #define AR_TRACE 1   // (Phase 8AG) instrumentation; absent in production builds
+#ifdef AR_TRACE
+__device__ unsigned long long* g_art = nullptr;   // host-mapped: [dev][cnt, sum_ns, max_ns, last_arrival]
+static __device__ __forceinline__ unsigned long long ar_gt() { unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); return t; }
+#endif
+
 __global__ void __launch_bounds__(kThreads) ar_rs16_kernel(float* x, int n4, float* rows, float* sums, size_t stride,
                                                           unsigned* bflags, int nm, int mi, int slot, int slots,
                                                           unsigned seq) {
@@ -3330,11 +3388,25 @@ __global__ void __launch_bounds__(kThreads) ar_rs16_kernel(float* x, int n4, flo
         uint2* mine = row(mi);
         for (int q = lo + threadIdx.x; q < hi; q += blockDim.x) mine[q] = to_h4(sat4(x4[q]));
     }
+#ifdef AR_TRACE
+    const unsigned long long t_arr = (threadIdx.x == 0 && blockIdx.x == 0) ? ar_gt() : 0ull;
+#endif
     __threadfence_system();
     __syncthreads();
     if (threadIdx.x == 0) *(volatile unsigned*) rflag(mi) = seq;
     if ((int) threadIdx.x < nm && (int) threadIdx.x != mi) wait_at_least(rflag(threadIdx.x), seq);
     __syncthreads();
+#ifdef AR_TRACE
+    if (threadIdx.x == 0 && blockIdx.x == 0 && t_arr && g_art) {
+        const unsigned long long w = ar_gt() - t_arr;
+        g_art[mi * 4 + 0] += 1ull;
+        g_art[mi * 4 + 1] += w;
+        if (w > g_art[mi * 4 + 2]) g_art[mi * 4 + 2] = w;
+        const int sl = (int) (seq % 40u);            // layer proxy: one AR a layer
+        g_art[64 + mi * 80 + sl * 2 + 0] += w;       // sum per layer
+        g_art[64 + mi * 80 + sl * 2 + 1] += 1ull;    // count per layer
+    }
+#endif
     const int c0 = min(hi, lo + mi * cs), c1 = min(hi, c0 + cs);
     for (int q = c0 + threadIdx.x; q < c1; q += blockDim.x) {
         float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -3788,17 +3860,31 @@ bool pdl_on() {
 #endif
 }
 
-// MAYA_DS4_RESIDENT_SKIP_W / MAYA_DS4_RESIDENT_TOPK (MAYA_ names alias them), read once; 0 = off
+// STRATA_DS4_RESIDENT_SKIP_W / STRATA_DS4_RESIDENT_TOPK (MAYA_ names alias them), read once; 0 = off
+// STRATA_DS4_RESIDENT_BIAS=F (Phase 8T): taken off the selection score of every expert that is not in VRAM, so the
+// router prefers a resident expert when the scores are close.  Selection only - the mixture weights keep the unbiased
+// scores (sc), so what is summed is still the router's own weighting.
 namespace {
 struct ResidentSkip {
     float w;
     int k;
+    float b;
+    float btop;    // (Phase 8AB) the penalty for the FIRST pick only: 0 keeps the router's own top expert
+    // (Phase 8BT) AcceptMoE-flavoured per-block adaptive penalty: a verification block of T rows activates the union
+    // of its rows' experts, so a miss costs more the wider the block.  base 0 (default) = off, bit-identical.
+    float abs;       // STRATA_DS4_RESIDENT_ABS: the base penalty at T=1
+    float abs_block; // STRATA_DS4_RESIDENT_ABS_BLOCK: added per extra verified row (0 = a flat penalty)
 };
 ResidentSkip resident_skip() {
     static const ResidentSkip rs = [] {
-        ResidentSkip r{0.0f, 0};
-        if (const char* v = std::getenv("MAYA_DS4_RESIDENT_SKIP_W")) r.w = std::max(0.0f, std::min(0.9f, (float) std::atof(v)));
-        if (const char* v = std::getenv("MAYA_DS4_RESIDENT_TOPK")) r.k = std::max(0, std::min(kPicks, std::atoi(v)));
+        ResidentSkip r{0.0f, 0, 0.0f, 0.0f, 0.0f, 0.0f};
+        if (const char* v = std::getenv("STRATA_DS4_RESIDENT_SKIP_W")) r.w = std::max(0.0f, std::min(0.9f, (float) std::atof(v)));
+        if (const char* v = std::getenv("STRATA_DS4_RESIDENT_TOPK")) r.k = std::max(0, std::min(kPicks, std::atoi(v)));
+        if (const char* v = std::getenv("STRATA_DS4_RESIDENT_BIAS")) r.b = std::max(0.0f, std::min(1.0e6f, (float) std::atof(v)));
+        r.btop = r.b;   // (the top pick's penalty follows the general one unless it is set on its own)
+        if (const char* v = std::getenv("STRATA_DS4_RESIDENT_BIAS_TOP")) r.btop = std::max(0.0f, std::min(1.0e6f, (float) std::atof(v)));
+        if (const char* v = std::getenv("STRATA_DS4_RESIDENT_ABS")) r.abs = std::max(0.0f, std::min(1.0e6f, (float) std::atof(v)));
+        if (const char* v = std::getenv("STRATA_DS4_RESIDENT_ABS_BLOCK")) r.abs_block = std::max(0.0f, std::min(16.0f, (float) std::atof(v)));
         return r;
     }();
     return rs;
@@ -3812,8 +3898,14 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
     if (req == nullptr || host_done == nullptr) resp = nullptr;
     if (resp == nullptr) cpu_any = nullptr;
     const ResidentSkip rs = resident_skip();
+    // (8BT) the per-block adaptive penalty: base + abs_block per extra verified row (0 base = the plain path)
+    float rb = rs.b, rbt = rs.btop;
+    if (rs.abs > 0.0f) {
+        const float f = rs.abs * (1.0f + rs.abs_block * (float) (T > 1 ? T - 1 : 0));
+        rb = f; rbt = f;
+    }
     pdl_launch(route_publish_kernel, T, 512, 0, s, logits, bias, n, k, route_scale, vram, x, dim, idx, w, plan_ptr, req,
-               vl != 0 ? bias_vl : nullptr, vl, cpu_any, rs.w, rs.k);
+               vl != 0 ? bias_vl : nullptr, vl, cpu_any, rs.w, rs.k, rb, rbt);
     if (req != nullptr) pdl_launch(publish_kernel, 1, 1, 0, s, req, T, seq, na0, na1, resp, cpu_any, host_done);
 }
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s) {
@@ -3826,7 +3918,11 @@ bool route_pair(const RoutePair& a, cudaStream_t s) {
         return false;
     RoutePair b = a;
     const ResidentSkip rs = resident_skip();
-    b.rs_w = rs.w, b.rs_k = rs.k;
+    b.rs_w = rs.w, b.rs_k = rs.k, b.rs_b = rs.b, b.rs_btop = rs.btop;
+    if (rs.abs > 0.0f) {   // (8BT) as route_publish's: a wider verification block biases harder toward resident
+        const float f = rs.abs * (1.0f + rs.abs_block * (float) (a.T > 1 ? a.T - 1 : 0));
+        b.rs_b = f; b.rs_btop = f;
+    }
     route_pair_kernel<<<dim3(2, (unsigned) b.T), 512, 0, s>>>(b);
     if (cudaGetLastError() != cudaSuccess) return false;   // (a routing that did not go in is never published)
     publish_kernel<<<1, 1, 0, s>>>(a.req, a.T, a.seq, a.na0, a.na1, nullptr, nullptr, nullptr);
@@ -4068,9 +4164,18 @@ bool copy_regions(const CopyRegions& r, cudaStream_t s) {
     return true;
 }
 
+// (8CC) replicate's source gather (see rep_gather_kernel): nothing launched for 0 bytes.
+void rep_gather(uint8_t* dst, const uint8_t* src, const int* g_first, size_t rb, size_t bytes, cudaStream_t s) {
+    if (bytes == 0) return;
+    const unsigned bx = (unsigned) std::max<size_t>(1, std::min<size_t>(64, (bytes + kThreads - 1) / kThreads));
+    rep_gather_kernel<<<bx, kThreads, 0, s>>>(dst, src, g_first, rb, bytes);
+}
+
 void compress_win(const float* kv, const float* score, float* kv_state, float* score_state, int ratio, int p0, int T,
-                  int d, const float* w, float eps, float* latent, cudaStream_t s) {
-    pdl_launch(compress_kernel, 1, 512, 0, s, kv, score, kv_state, score_state, ratio, p0, T, d, w, eps, latent);
+                  int d, const float* w, float eps, float* latent, cudaStream_t s, float* log_kv, float* log_sc,
+                  int log_h, const int64_t* p0p) {
+    pdl_launch(compress_kernel, 1, 512, 0, s, kv, score, kv_state, score_state, ratio, p0, T, d, w, eps, latent, log_kv,
+               log_sc, log_h, p0p);
 }
 
 void index_score(const float* q, const float* w, const void* k, int heads, int hd, int T, int n, const int* cand,
@@ -4591,13 +4696,20 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
     }
     // a few queries (a decode step, a short window): their selected rows decoded once a query into the scratch, then
     // the BF16 rows' kernel itself (heads_per_block -1: this way at any T)
+    // Experimental Phase 7P: bypass the unpack scratch launch for one-token
+    // FP4 decode when the original packed rows are directly available.
+    if (T == 1 && ckv_fmt == kKvFp4 && std::getenv("DS4_PACKED_ATTN") != nullptr && heads % 8 == 0) {
+        pdl_launch(sparse_attn_packed_kernel<8>, dim3(heads / 8, T), kThreads, 0, s, q, win,
+                   (const uint8_t*) ckv, sel, sel_stride, a, sink, heads, scale, out);
+        return;
+    }
     const bool few = heads_per_block == -1 || (heads_per_block == 0 && T <= kAttnScratchT);   // (0: attn_few)
     if (few && attn_scr_fits(T, sel_stride, scr)) {
         pdl_launch(unpack_sel_kernel, dim3(cdiv(sel_stride, kStage), T), kThreads, 0, s, (const uint8_t*) ckv, sel, sel_stride, a,
                    scr->cap, scr->rows);
 #if !defined(STRATA_USE_HIP)
-        if (T == 1)   // (V100: the loads ahead pay for the decode's kernel at one query, not at more)
-            pdl_launch(sparse_attn_kernel<true, 8>, dim3(heads, T), kThreads, 0, s, q, win, scr->rows, nullptr, scr->cap, a, sink,
+        if (T == 1)   // (V100: preload four rows to reduce register pressure while retaining row reuse)
+            pdl_launch(sparse_attn_kernel<true, 4>, dim3(heads, T), kThreads, 0, s, q, win, scr->rows, nullptr, scr->cap, a, sink,
                        heads, d, scale, out);
         else
 #endif
@@ -4651,8 +4763,8 @@ bool sparse_attn_rows(const float* q, const uint16_t* win, const AttnCkv& c, con
     return true;
 }
 
-void ring_to_ext(const uint8_t* ring, uint16_t* ext, int64_t p0, int n, int d, cudaStream_t s) {
-    pdl_launch(ring_to_ext_kernel, n, kThreads, 0, s, ring, ext, (long long) p0, n, d);
+void ring_to_ext(const uint8_t* ring, uint16_t* ext, int64_t p0, int n, int d, cudaStream_t s, const int64_t* p0p) {
+    pdl_launch(ring_to_ext_kernel, n, kThreads, 0, s, ring, ext, (long long) p0, p0p, n, d);
 }
 void ring_to_ext_runs(const RingRuns& r, uint16_t* ext, int n, int d, cudaStream_t s) {
     if (r.runs > 0) pdl_launch(ring_to_ext_runs_kernel, dim3(n, r.runs), kThreads, 0, s, r, ext, n, d);
@@ -4666,24 +4778,104 @@ void ext_to_ring_runs(const RingRuns& r, const uint16_t* ext, int n, int d, cuda
     for (int k = 0; k < r.runs; ++k) tmax = std::max(tmax, r.T[k]);
     if (tmax > 0) pdl_launch(ext_to_ring_runs_kernel, dim3(tmax, r.runs), kThreads, 0, s, r, ext, n, d);
 }
-void ext_to_ring(const uint16_t* ext, uint8_t* ring, int64_t p0, int n, int T, int d, cudaStream_t s, uint8_t* backup) {
+void ext_to_ring(const uint16_t* ext, uint8_t* ring, int64_t p0, int n, int T, int d, cudaStream_t s, uint8_t* backup,
+                 uint8_t* log, int log_h, const int64_t* p0p) {
     if (d % 32 != 0) {
         std::fprintf(stderr, "ds4 ext_to_ring: row of %d not covered\n", d);
         return;
     }
-    pdl_launch(ext_to_ring_kernel, T, kThreads, 0, s, ext, ring, (long long) p0, n, T, d, backup);
+    pdl_launch(ext_to_ring_kernel, T, kThreads, 0, s, ext, ring, (long long) p0, p0p, n, T, d, backup, log, log_h);
 }
-void ring_restore(uint8_t* ring, const uint8_t* backup, int64_t p0, int n, int keep, int T, int d, cudaStream_t s) {
+void ring_restore(uint8_t* ring, const uint8_t* backup, int64_t p0, int n, int keep, int T, int d, cudaStream_t s, const int64_t* p0p) {
     if (T > keep)
-        pdl_launch(ring_restore_kernel, T - keep, kThreads, 0, s, ring, backup, (long long) p0, n, keep, kv_row_bytes(kKvFp8, d));
+        pdl_launch(ring_restore_kernel, T - keep, kThreads, 0, s, ring, backup, (long long) p0, p0p, n, keep, kv_row_bytes(kKvFp8, d));
 }
-void ring_restore_batch(const RingBatch& b, int64_t p0, int n, int keep, int T, int d, cudaStream_t s) {
+void ring_restore_batch(const RingBatch& b, int64_t p0, int n, int keep, int T, int d, cudaStream_t s, const int64_t* p0p) {
     if (T > keep && b.n > 0)
-        pdl_launch(ring_restore_batch_kernel, dim3(T - keep, b.n), kThreads, 0, s, b, (long long) p0, n, keep,
+        pdl_launch(ring_restore_batch_kernel, dim3(T - keep, b.n), kThreads, 0, s, b, (long long) p0, p0p, n, keep,
                    kv_row_bytes(kKvFp8, d));
 }
-void comp_restore_batch(const CompBatch& b, int64_t p0, int keep, int d, cudaStream_t s) {
-    if (b.n > 0) pdl_launch(comp_restore_batch_kernel, b.n, kThreads, 0, s, b, (long long) p0, keep, d);
+void comp_restore_batch(const CompBatch& b, int64_t p0, int keep, int d, cudaStream_t s, const int64_t* p0p) {
+    if (b.n > 0) pdl_launch(comp_restore_batch_kernel, b.n, kThreads, 0, s, b, (long long) p0, p0p, keep, d);
+}
+// restore()'s undo-log rewind (DS4_UNDO_LOG).  Undoing positions limit .. pos-1 in reverse leaves each slot holding the
+// earliest undone write's overwritten row - equivalently: slot s of the ring is log[p_min % log_h], where p_min is the
+// smallest position in [limit, pos-1] with p_min % win == s (none: the slot is not written in the range, left as it is).
+// One block a slot (x) per layer (y), so no two blocks write the same slot - correct even when pos - limit > win.
+__global__ void ring_undo_batch_kernel(const UndoBatch b, long long limit, long long pos, int win, int log_h, size_t rb) {
+    pdl_wait();
+    pdl_trigger();
+    const int s = blockIdx.x, li = blockIdx.y;
+    const long long lo = limit, hi = pos - 1;
+    const long long pmin = lo + (((long long) s - lo) % win + win) % win;
+    if (pmin > hi) return;
+    uint8_t* row = b.ring[li] + (size_t) s * rb;
+    const uint8_t* src = b.log[li] + (size_t) (pmin % log_h) * rb;
+    for (size_t i = threadIdx.x; i < rb; i += blockDim.x) row[i] = src[i];
+}
+// The same for the compressors' partial groups: slot s of layer li is log[(p_min % log_h) * d], p_min the smallest
+// position in [limit, pos-1] with p_min % ratio == s.
+__global__ void comp_undo_batch_kernel(const CompUndoBatch b, long long limit, long long pos, int log_h, int d) {
+    pdl_wait();
+    pdl_trigger();
+    const int s = blockIdx.x, li = blockIdx.y;
+    const int R = b.ratio[li];
+    if (s >= R) return;
+    const long long lo = limit, hi = pos - 1;
+    const long long pmin = lo + (((long long) s - lo) % R + R) % R;
+    if (pmin > hi) return;
+    const size_t lr = (size_t) (pmin % log_h) * (size_t) d;
+    float* kv_row = b.kv_state[li] + (size_t) s * d;
+    float* sc_row = b.score_state[li] + (size_t) s * d;
+    for (int e = threadIdx.x; e < d; e += blockDim.x) {
+        kv_row[e] = b.log_kv[li][lr + e];
+        sc_row[e] = b.log_sc[li][lr + e];
+    }
+}
+void ring_undo_batch(const UndoBatch& b, int64_t limit, int64_t pos, int win, int log_h, int d, cudaStream_t s) {
+    if (pos > limit && b.n > 0)
+        pdl_launch(ring_undo_batch_kernel, dim3((unsigned) win, (unsigned) b.n), kThreads, 0, s, b, (long long) limit,
+                   (long long) pos, win, log_h, kv_row_bytes(kKvFp8, d));
+}
+void comp_undo_batch(const CompUndoBatch& b, int64_t limit, int64_t pos, int log_h, int d, cudaStream_t s) {
+    if (pos <= limit || b.n <= 0) return;
+    int maxr = 1;
+    for (int i = 0; i < b.n; ++i) maxr = std::max(maxr, b.ratio[i]);
+    pdl_launch(comp_undo_batch_kernel, dim3((unsigned) maxr, (unsigned) b.n), kThreads, 0, s, b, (long long) limit,
+               (long long) pos, log_h, d);
+}
+// a verify window's accepted rows (i < keep) into the undo log: the ring from ring_bak[i], the compressor from
+// snap[slot] (i < ratio) or the window's raw row kv_rows[i - ratio].  One block a row (x) per layer (y).
+__global__ void undo_commit_batch_kernel(const UndoCommitBatch b, long long p0_arg, const int64_t* p0p, int keep, int log_h, int d) {
+    const long long p0 = p0p != nullptr ? (long long) *p0p : p0_arg;   // (8BX) device-read position when given
+    pdl_wait();
+    pdl_trigger();
+    const int i = blockIdx.x, li = blockIdx.y;
+    if (i >= keep) return;
+    const long long p = p0 + i;
+    if (b.undo_ring[li] != nullptr) {
+        const size_t rb = kv_row_bytes(kKvFp8, d);
+        uint8_t* dst = b.undo_ring[li] + (size_t) (p % log_h) * rb;
+        const uint8_t* src = b.ring_bak[li] + (size_t) i * rb;
+        for (size_t x = threadIdx.x; x < rb; x += blockDim.x) dst[x] = src[x];
+    }
+    if (b.undo_kv[li] != nullptr) {
+        const int R = b.ratio[li];
+        const int slot = (int) (p % R);
+        const size_t lr = (size_t) (p % log_h) * (size_t) d;
+        const float* kvsrc = (i < R) ? b.snap[li] + (size_t) slot * d : b.kv_rows[li] + (size_t) (i - R) * d;
+        const float* scsrc =
+            (i < R) ? b.snap[li] + (size_t) R * d + (size_t) slot * d : b.sc_rows[li] + (size_t) (i - R) * d;
+        for (int e = threadIdx.x; e < d; e += blockDim.x) {
+            b.undo_kv[li][lr + e] = kvsrc[e];
+            b.undo_sc[li][lr + e] = scsrc[e];
+        }
+    }
+}
+void undo_commit_batch(const UndoCommitBatch& b, int64_t p0, int keep, int log_h, int d, cudaStream_t s, const int64_t* p0p) {
+    if (keep <= 0 || b.n <= 0) return;
+    pdl_launch(undo_commit_batch_kernel, dim3((unsigned) keep, (unsigned) b.n), kThreads, 0, s, b, (long long) p0, p0p, keep,
+               log_h, d);
 }
 void hc_mean(const float* h, int T, int hc, int dim, float* out, long long out_stride, cudaStream_t s) {
     pdl_launch(hc_mean_kernel, dim3(cdiv(dim, kThreads), T), kThreads, 0, s, h, hc, dim, out, out_stride);
@@ -4784,7 +4976,58 @@ void set_flag(unsigned* flag, unsigned v, cudaStream_t s) {
 void tab_set(const unsigned long long* pairs, int n, cudaStream_t s) {
     if (n > 0) pdl_launch(tab_set_kernel, cdiv(n, 128), 128, 0, s, pairs, n);
 }
+#ifdef AR_TRACE
+static unsigned long long* ar_trace_mem() {
+    static unsigned long long* p = nullptr;
+    if (p == nullptr) {
+        void* hp = nullptr;
+        cudaHostAlloc(&hp, sizeof(unsigned long long) * 512, cudaHostAllocMapped);
+        std::memset(hp, 0, sizeof(unsigned long long) * 512);
+        p = (unsigned long long*) hp;
+    }
+    return p;
+}
+static void ar_trace_bind(int dev) {   // each device gets its own copy of the symbol
+    static bool done[64] = {false};
+    if (dev < 0 || dev >= 64) return;
+    if (!done[dev]) {
+        done[dev] = true;
+        unsigned long long* hp = ar_trace_mem();
+        unsigned long long* dp = nullptr;
+        cudaHostGetDevicePointer((void**) &dp, hp, 0);
+        int cur = 0; cudaGetDevice(&cur);
+        cudaSetDevice(dev);
+        cudaMemcpyToSymbol(g_art, &dp, sizeof(dp));
+        cudaSetDevice(cur);
+    }
+}
+static void ar_trace_dump(const char* where) {
+    unsigned long long* p = ar_trace_mem();
+    std::fprintf(stderr, "artrace%s:", where);
+    for (int d = 0; d < 4; ++d)
+        if (p[d * 4 + 0])
+            std::fprintf(stderr, " dev%d n=%llu mean=%lluus max=%lluus", d, p[d * 4 + 0],
+                         (p[d * 4 + 1] / p[d * 4 + 0]) / 1000ull, p[d * 4 + 2] / 1000ull);
+    std::fprintf(stderr, "\n");
+    std::fprintf(stderr, "arperlayer:");
+    for (int d = 0; d < 4; ++d) {
+        if (!p[d * 4 + 0]) continue;
+        std::fprintf(stderr, "\n  dev%d:", d);
+        for (int sl = 0; sl < 40; ++sl) {
+            const unsigned long long c = p[64 + d * 80 + sl * 2 + 1];
+            if (c) std::fprintf(stderr, " %llu", (p[64 + d * 80 + sl * 2 + 0] / c) / 1000ull);
+        }
+    }
+    std::fprintf(stderr, "\n");
+}
+#endif
+
 void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s) {
+#ifdef AR_TRACE
+    { int cur = -1; cudaGetDevice(&cur); ar_trace_bind(cur);
+      static int tick = 0;
+      if (++tick % 128 == 0) ar_trace_dump(""); }
+#endif
     const int slot = (int) (seq % (unsigned) a.slots);
     if (a.nm == 2 && a.ar2 > 0 && a.pflags != nullptr) {   // (DS4_AR2: the put and the sums in one pipelined launch)
         const int n4 = n / 4;
@@ -4801,7 +5044,16 @@ void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned
             return e == nullptr || std::atoi(e) != 0;   // (on unless DS4_AR_F16=0)
         }();
         const int n4 = n / 4;
-        const int blocks = std::max(1, std::min(kArBlocks, cdiv(n4, kThreads)));
+        // (Phase 8BA) STRATA_DS4_AR_BLOCKS: the reduce-scatter's block count. 64 is the default and is far more
+        // than a latency-bound collective of a few KB needs; each block spins on the members' flags and re-reads
+        // their rows, so the tail blocks mostly add contention and SM occupancy. Clamped to kArBlocks because
+        // the flag array's stride is laid out for that many (a smaller grid simply uses a prefix of it).
+        static const int ar_blocks = [] {
+            const char* v = std::getenv("STRATA_DS4_AR_BLOCKS");
+            const int n = v != nullptr ? std::atoi(v) : 0;
+            return (n > 0) ? std::min(n, kArBlocks) : kArBlocks;
+        }();
+        const int blocks = std::max(1, std::min(ar_blocks, cdiv(n4, kThreads)));
         if (f16)
             pdl_launch(ar_rs16_kernel, blocks, kThreads, 0, s, x, n4, a.data, a.sums, a.stride, a.bflags, a.nm, mi, slot, a.slots, seq);
         else

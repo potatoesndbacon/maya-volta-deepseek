@@ -49,6 +49,18 @@ void embed(const uint16_t* rows_bf16, int T, float* h, int dim, int hc, cudaStre
 /// dst is given, or packed (quant > 0: the cache format of that number, kv_row_bytes) to pdst + v * pdst_stride bytes
 /// when pdst is given (x then left as it was).
 struct Finish {
+    const int* n_dev = nullptr;   // (8BQ) vectors >= *n_dev are skipped: the launch is shape-stable
+    // (8BX) the same idea for the two other position-derived values: the destination's row offset (g_first) and
+    // the rotary position base. With these set, no part of a launch depends on where in the context we are.
+    const int* off_dev = nullptr;  // destination row index (g_first), read on the device
+    long long off_stride = 0;      // bytes a destination row
+    const int* pos_dev = nullptr;  // rotary base index (g_first): position = *pos_dev * pos_step
+    // (8CC) the window's position p0 from the plan buffer: g_first = *p0_dev / pos_step, ng = (*p0_dev + T) /
+    // pos_step - *p0_dev / pos_step, rotary base = g_first * pos_step (pos_step > 1) or *p0_dev (pos_step 1). Set on
+    // the decode path so no per-layer ng/g_first publish is needed.
+    const int64_t* p0_dev = nullptr;
+    int T = 1;
+    int off = 0;                   // g_first, computed in finish_kernel (finish_vec's packed destination offset)
     const float* w = nullptr;
     float eps = 1e-20f;
     int rd = 0, pos = 0, inverse = 0, vpp = 1, pos_step = 1;
@@ -174,12 +186,16 @@ struct CopyRegions {
     int n = 0;
 };
 bool copy_regions(const CopyRegions& r, cudaStream_t s);
+/// (8CC) replicate's source gather: `bytes` bytes from `src + (*g_first) * rb` to `dst`, the source's row offset
+/// read from device memory (the plan buffer's g_first) so no host pointer carries the position (capture-ready).
+void rep_gather(uint8_t* dst, const uint8_t* src, const int* g_first, size_t rb, size_t bytes, cudaStream_t s);
 
 /// The ratio-r compressor over a window: token t (position p0 + t) takes slot (p0 + t) % r of the state; each token that
 /// completes a group writes the group's pooled latent (softmax over the slots, per value, then rmsnorm(w)) to the next
 /// row of latent.
 void compress_win(const float* kv, const float* score, float* kv_state, float* score_state, int ratio, int p0, int T,
-                  int d, const float* w, float eps, float* latent, cudaStream_t s);
+                  int d, const float* w, float eps, float* latent, cudaStream_t s, float* log_kv = nullptr,
+                  float* log_sc = nullptr, int log_h = 0, const int64_t* p0p = nullptr);
 
 /// Per-query sizes, by value - or (gen > 0, a chunk of any length) made on the device from the query's position: query
 /// t at position p0 + t has nn = (p0 + t + 1) / R compressed positions and cb = min(ccap, ceil(nn / blk)) candidate
@@ -248,6 +264,7 @@ struct AttnRows {
     // position lo or later (0: the whole window - a truncated prompt's consumer layers see only its tail)
     int gen = 0, t0 = 0, win = 0, R = 0, kcap = 0;
     long long p0 = 0, lo = 0;
+    int direct = 0; // eligible all-position decode: unpack compressed rows by positional index
 };
 void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
                  const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
@@ -270,9 +287,10 @@ bool sparse_attn_rows(const float* q, const uint16_t* win, const AttnCkv& c, con
 /// ring[(p0 + t) % n] = ext[n + t] for t < T.  The ring's rows kKvFp8 (each group of 32 at the smallest power-of-two
 /// scale its BF16 values fit under: exact for values on the FP8 grid, the window's), the window buffer's BF16 (p0 = n:
 /// the ring's rows as they lie).
-void ring_to_ext(const uint8_t* ring, uint16_t* ext, int64_t p0, int n, int d, cudaStream_t s);
+void ring_to_ext(const uint8_t* ring, uint16_t* ext, int64_t p0, int n, int d, cudaStream_t s,
+                  const int64_t* p0p = nullptr);   // (8BX) null: the argument, as before
 void ext_to_ring(const uint16_t* ext, uint8_t* ring, int64_t p0, int n, int T, int d, cudaStream_t s,
-                 uint8_t* backup = nullptr);
+                 uint8_t* backup = nullptr, uint8_t* log = nullptr, int log_h = 0, const int64_t* p0p = nullptr);
 
 /// (DS4_MULTI_ATTN, --parallel) a multi step's runs at once - run k one conversation's T[k] rows from position p0[k],
 /// its ring ring[k], its window buffer the rows e0[k] .. e0[k] + n + T[k] - 1 of one shared buffer (ds4_multi_attn.hpp):
@@ -281,6 +299,8 @@ void ext_to_ring(const uint16_t* ext, uint8_t* ring, int64_t p0, int n, int T, i
 struct RingRuns {
     uint8_t* ring[kWin] = {};
     uint8_t* bak[kWin] = {};
+    uint8_t* log[kWin] = {};   // (the undo log's ring rows, or null; log_h: its horizon in tokens)
+    int log_h = 0;
     long long p0[kWin] = {};
     int e0[kWin] = {}, T[kWin] = {};
     int runs = 0;
@@ -302,7 +322,7 @@ struct IotaRows {
 };
 void iota_rows_at(int* out, int T, const IotaRows& r, int stride, cudaStream_t s);
 /// A speculative window's rollback: ring[(p0 + t) % n] = backup[t] for keep <= t < T (the rows ext_to_ring replaced).
-void ring_restore(uint8_t* ring, const uint8_t* backup, int64_t p0, int n, int keep, int T, int d, cudaStream_t s);
+void ring_restore(uint8_t* ring, const uint8_t* backup, int64_t p0, int n, int keep, int T, int d, cudaStream_t s, const int64_t* p0p = nullptr);
 /// The same for up to kMaxRingBatch layers' rings at once (one launch).
 constexpr int kMaxRingBatch = 64;
 struct RingBatch {
@@ -310,7 +330,7 @@ struct RingBatch {
     const uint8_t* bak[kMaxRingBatch] = {};
     int n = 0;
 };
-void ring_restore_batch(const RingBatch& b, int64_t p0, int n, int keep, int T, int d, cudaStream_t s);
+void ring_restore_batch(const RingBatch& b, int64_t p0, int n, int keep, int T, int d, cudaStream_t s, const int64_t* p0p = nullptr);
 /// The compressors' state back to a window's first `keep` positions, up to kMaxRingBatch layers at once: each layer's
 /// snapshot (ratio x d kv, then ratio x d scores: the state before the window), then the kept rows (kv[t], score[t],
 /// t < keep) at their slots (p0 + t) % ratio - compress_win's state over the snapshot, its pools' latent rows left out.
@@ -323,7 +343,42 @@ struct CompBatch {
     int ratio[kMaxRingBatch] = {};
     int n = 0;
 };
-void comp_restore_batch(const CompBatch& b, int64_t p0, int keep, int d, cudaStream_t s);
+void comp_restore_batch(const CompBatch& b, int64_t p0, int keep, int d, cudaStream_t s, const int64_t* p0p = nullptr);
+/// A restore()'s undo-log rewind (DS4_UNDO_LOG): each layer's ring rows back to `limit` from its undo log (circular
+/// over log_h) - slot s from log[p_min % log_h], p_min the smallest position in [limit, pos-1] with p_min % win == s -
+/// up to kMaxRingBatch layers at once.
+struct UndoBatch {
+    uint8_t* ring[kMaxRingBatch] = {};
+    const uint8_t* log[kMaxRingBatch] = {};
+    int n = 0;
+};
+void ring_undo_batch(const UndoBatch& b, int64_t limit, int64_t pos, int win, int log_h, int d, cudaStream_t s);
+/// The same for the compressors' partial groups: each layer's slot (p % ratio) restored from its undo log's row
+/// (p % log_h) - p the smallest position in [limit, pos-1] with p % ratio == slot - up to kMaxRingBatch layers at once.
+struct CompUndoBatch {
+    float* kv_state[kMaxRingBatch] = {};
+    float* score_state[kMaxRingBatch] = {};
+    const float* log_kv[kMaxRingBatch] = {};
+    const float* log_sc[kMaxRingBatch] = {};
+    int ratio[kMaxRingBatch] = {};
+    int n = 0;
+};
+void comp_undo_batch(const CompUndoBatch& b, int64_t limit, int64_t pos, int log_h, int d, cudaStream_t s);
+/// A verify window's ACCEPTED rows into the undo log (DS4_UNDO_LOG): the rows it wrote during forward() were spec_win
+/// and not logged, so rollback() writes their overwritten values here - the ring from ring_bak[i], the compressor from
+/// snap[slot] (i < ratio) or the window's own raw row kv_rows[i - ratio].  Accepted rows i < keep only.
+struct UndoCommitBatch {
+    uint8_t* undo_ring[kMaxRingBatch] = {};
+    const uint8_t* ring_bak[kMaxRingBatch] = {};
+    float* undo_kv[kMaxRingBatch] = {};
+    float* undo_sc[kMaxRingBatch] = {};
+    const float* snap[kMaxRingBatch] = {};       // 2*ratio*hd: the pre-window partial (kv, then score)
+    const float* kv_rows[kMaxRingBatch] = {};    // the window's raw kv rows (t = 0..T-1)
+    const float* sc_rows[kMaxRingBatch] = {};    // its raw score rows
+    int ratio[kMaxRingBatch] = {};
+    int n = 0;
+};
+void undo_commit_batch(const UndoCommitBatch& b, int64_t p0, int keep, int log_h, int d, cudaStream_t s, const int64_t* p0p = nullptr);
 
 /// Engram.  rows: n FP8 E4M3 rows of hd values, scales n x (hd / 32) E8M0 -> out F32 [n * hd].  fmt 1 / 2 / 3: the rows are
 /// ggml Q6_K superblocks (210 bytes a 256 values), IQ4_NL blocks (18 a 32) or Q5_K superblocks (176 a 256) instead,
@@ -416,6 +471,8 @@ struct RoutePair {
     int T = 1;   // (=2: a window's rows, 1 .. kWin)
     float rs_w = 0.0f;   // (route_pair sets these from MAYA_DS4_RESIDENT_SKIP_W / _TOPK)
     int rs_k = 0;
+    float rs_b = 0.0f;   // (Phase 8T) STRATA_DS4_RESIDENT_BIAS: selection penalty for an expert not in VRAM
+    float rs_btop = 0.0f;   // (Phase 8AB) STRATA_DS4_RESIDENT_BIAS_TOP: the same, for the first pick only
 };
 bool route_pair(const RoutePair& a, cudaStream_t s);
 /// Waits (one thread, on the device) until *seq_ptr == seq.

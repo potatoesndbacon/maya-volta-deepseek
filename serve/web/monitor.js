@@ -207,6 +207,31 @@ function ContextCard({m}) {
   </section>`;
 }
 
+// ------------------------------------------------------------------ prefill reuse: slot/prefix vs the undo log
+// the server's /metrics "reuse": the tokens kept instead of re-read, split into the slot cache / shared prefix and the
+// undo log (DS4_UNDO_LOG, from the engine's STAT counters), with the log's rewind count, tokens and misses.
+function ReuseCard({m}) {
+  const r = m && m.reuse;
+  if (!r) return null;
+  const total = r.reused || 0, undo = Math.min(r.undo_reused || 0, total), slot = Math.max(0, total - undo);
+  const prompt = (m.totals || {}).prompt_tokens || 0, read = Math.max(0, prompt - total);
+  const all = prompt ? (100 * total) / prompt : 0;
+  const allTxt = !prompt ? "0" : all >= 99.95 ? "≥99.9" : all.toFixed(all < 10 ? 2 : 1);
+  const pct = (n) => (total ? Math.round((100 * n) / total) : 0);
+  return html`<section class="card" aria-label="Prefill reuse">
+    <div class="card__head"><span class="card__title">Prefill reuse</span>
+      <span class="card__sub">${allTxt}% of prompt tokens kept instead of re-read · ${fmt(read)} read, since start</span></div>
+    <div class="ctx__nums"><span class="ctx__big num">${fmt(total)}<small> tokens</small></span>
+      <span class="ctx__pct num"><b>${pct(slot)}%</b> slot · <b>${pct(undo)}%</b> undo log</span></div>
+    <div class="legend">
+      <span><i class="sw sw--reused"></i>Slot / shared prefix <b class="num">${fmt(slot)}</b></span>
+      <span><i class="sw sw--fresh"></i>Undo log <b class="num">${fmt(undo)}</b></span>
+      <span><i class="sw sw--free"></i>Rewinds <b class="num">${fmt(r.undo_hits || 0)}</b> · ${fmt(r.undo_rewound || 0)} tok · ${fmt(r.undo_misses || 0)} miss</span>
+    </div>
+    <p class="card__note card__note--tip">The undo log rewinds a prompt-tail edit within <b>DS4_UNDO_LOG</b> tokens (host-pinned, 16 K); slot / shared prefix is a continued or kept conversation, or a shared start. Unset DS4_UNDO_LOG = no undo-log line.</p>
+  </section>`;
+}
+
 // ------------------------------------------------------------------ where the experts live (the engine's STAT lines)
 // GLM's engine: where each routed expert came from while the model writes; DeepSeek's (maya-ds4): the experts the CPU lane
 // computed, what the storage read, the cache's moves and the n-gram memory (Engram) a token; MiniMax's (maya-mm3): the
@@ -616,6 +641,7 @@ export function MonitorPage() {
         <${Banners} m=${m}/>
         <div class="mon__top"><${Throughput} m=${m}/><${RightNow} m=${m}/></div>
         <${ContextCard} m=${m}/>
+        <${ReuseCard} m=${m}/>
         <${Tiers} t=${m.tiers} eng=${m.engine || {}}/>
         <${GpuMap} m=${m}/>
         <${Hardware} m=${m} gpuEach=${gpuEach}/>

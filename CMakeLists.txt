@@ -260,6 +260,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(ds4_marks_test tests/ds4_marks_test.cpp)
   target_link_libraries(ds4_marks_test PRIVATE strata_warnings)
   add_test(NAME ds4_marks_test COMMAND ds4_marks_test)
+  # maya-ds4's undo log (DS4_UNDO_LOG): the overwritten-slot replay contract restore() implements
+  add_executable(ds4_undo_log_test tests/ds4_undo_log_test.cpp)
+  target_link_libraries(ds4_undo_log_test PRIVATE strata_warnings)
+  add_test(NAME ds4_undo_log_test COMMAND ds4_undo_log_test)
   # maya-ds4's log-probabilities (GEN logprobs=): the reference, the penalties, ties, the kernel's pieces, the LP line
   add_executable(ds4_logprobs_test tests/ds4_logprobs_test.cpp)
   target_link_libraries(ds4_logprobs_test PRIVATE strata_warnings)

@@ -1,0 +1,23 @@
+{
+  "upstream_commit": "8b0a449c599fbb370a1dcc0979ae7c84d4310529",
+  "patch_sha256": "f2df4415010402f8683bf8a6894d97ecb8e246a403ace0f3f423556aba98297d",
+  "patch_applied_to_clean_upstream": true,
+  "changed_files_checked": 15,
+  "reconstructed_source_matches": 15,
+  "live_source_matches": 15,
+  "production_binary_sha256": "a0cc17c94e17e398f7053947f3f062214d1e2fb410196f1cb8331add8a24429a",
+  "binary_rebuild_performed": false,
+  "diff_check": "One trailing-space cleanup in src/ds4/ds4_main.cpp after source reconstruction; source-file-identities.json records final matching hashes.",
+  "clean_build": {
+    "performed": true,
+    "configuration": "CMake 3.31.6, CUDA 12.8.93, GCC 12.2, Release, CUDA SM70",
+    "executable_sha256": "2179f17e1fd89991e8f7eb6c17b9c1f734a431a9a8c20fae39a9146a72779a77",
+    "ctest_passed": [
+      "ds4_undo_log_test",
+      "ds4_logprobs_test",
+      "ds4_iq512_rows",
+      "ds4_iq512_rows_default",
+      "ds4_iq_host_test"
+    ]
+  }
+}

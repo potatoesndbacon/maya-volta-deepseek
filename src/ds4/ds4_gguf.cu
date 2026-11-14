@@ -912,6 +912,40 @@ __global__ void __launch_bounds__(kThreads) mx_down_kernel(const MxArgs a) {
     }
 }
 
+// (Phase 8BE) STRATA_DS4_COMBINE_THREADS: the MoE combine's block size. A decode step's combine is 5 120 floats
+// against six strided partial rows; at 128 threads that is a 40-block grid - under one block an SM - and each
+// thread's six loads have almost no concurrency to hide DRAM latency behind (55 us a launch, 10.3 % of kernel
+// time, for ~140 KB of traffic that should take a fraction of a microsecond). Smaller blocks spread the same
+// threads over more SMs.
+static int mx_combine_t() {
+    static const int n = [] {
+        const char* v = std::getenv("STRATA_DS4_COMBINE_THREADS");
+        int t = v != nullptr ? std::atoi(v) : 0;
+        if (t < 32) t = 128;
+        return std::min(256, (t / 32) * 32);
+    }();
+    return n;
+}
+
+// (Phase 8BM) cpu_flag / cpu_pmask live in `Resp`, which is cudaHostAllocMapped - so the combine's first act is two
+// PCIe round trips PER BLOCK (80 a launch at 40 blocks), each stalling before its __syncthreads. Measured on a
+// standalone replica: 12.7 us with those two ints in device memory, 55.9 us with them host-mapped, and the engine
+// reports 43.4. One block reads them over PCIe and publishes to a device copy; every block then reads VRAM.
+static constexpr int kCombFlags = 16;  // (8BM) = kWin (ds4_kernels.cuh:21): Resp.s cpu[] and pmask[] are each this long
+__global__ void comb_flags_kernel(const int* __restrict__ hsrc, int* __restrict__ dst, int n) {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = hsrc[i];
+}
+static int* comb_flags_dev(int n, cudaStream_t s, const int* hsrc) {
+    static int* buf[64] = {nullptr};
+    int dev = 0; cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 64) return nullptr;
+    if (buf[dev] == nullptr) {
+        if (cudaMalloc(&buf[dev], sizeof(int) * 2 * kCombFlags) != cudaSuccess) { buf[dev] = nullptr; return nullptr; }
+    }
+    pdl_launch(comb_flags_kernel, 1, 32, 0, s, hsrc, buf[dev], n);
+    return buf[dev];
+}
+
 struct CombArgs {
     const unsigned long long* plan_ptr;   // [T][8]
     const float* plan_w;                  // [T][8]
@@ -930,10 +964,10 @@ struct CombArgs {
 // grid (n_embd / 128, T): each token's outputs - the experts in plan order (an expert off the device adds 0, or its
 // CPU-lane part when cpu_pmask says the lane answered it: the same place in the sum either way), then the CPU lane's
 // summed part and the shared expert's (x3's combine)
-__global__ void __launch_bounds__(128) mx_combine_kernel(const CombArgs a) {
+__global__ void __launch_bounds__(256) mx_combine_kernel(const CombArgs a) {
     pdl_wait();
     pdl_trigger();
-    const int t = blockIdx.y, r = blockIdx.x * 128 + threadIdx.x;
+    const int t = blockIdx.y, r = blockIdx.x * blockDim.x + threadIdx.x;   // (8BE) blockDim, not a fixed 128
     // (the pick mask from the host's answer, read once a block: host-mapped, every thread's own read of it cost the
     //  kernel ~10x its time on two RTX PRO 6000s)
     __shared__ int s_pm, s_cf;
@@ -957,14 +991,44 @@ __global__ void __launch_bounds__(128) mx_combine_kernel(const CombArgs a) {
                 a.sh_out != nullptr ? a.sh_out[(size_t) t * a.n_embd + r] : 0.0f);
 }
 
+// #define MX_TRACE 1   // (Phase 8AJ) CPU-lane handshake timing; absent in production builds
+#ifdef MX_TRACE
+struct MxStat { unsigned long long n, sum, mx, over; };
+__device__ MxStat g_mxstat = {0, 0, 0, 0};
+static __device__ __forceinline__ unsigned long long mx_gt() { unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); return t; }
+static void mx_trace_dump() {
+    std::fprintf(stderr, "mxtrace:");
+    for (int d = 0; d < 4; ++d) {
+        int cur = 0; cudaGetDevice(&cur);
+        if (cudaSetDevice(d) != cudaSuccess) { cudaSetDevice(cur); continue; }
+        MxStat h{}; cudaMemcpyFromSymbol(&h, g_mxstat, sizeof(h));
+        cudaSetDevice(cur);
+        if (h.n) std::fprintf(stderr, " dev%d n=%llu mean=%lluns max=%lluns over1us=%llu", d, h.n, h.sum / h.n, h.mx, h.over);
+        else std::fprintf(stderr, " dev%d n=0", d);
+    }
+    std::fprintf(stderr, "\n");
+}
+#endif
+
 __global__ void mx_wait_kernel(const unsigned* p, unsigned v) {
     pdl_wait();
     if (threadIdx.x != 0) return;
+#ifdef MX_TRACE
+    const unsigned long long t0 = mx_gt();
+#endif
     while (*(volatile const unsigned*) p != v) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
         __nanosleep(200);
 #endif
     }
+#ifdef MX_TRACE
+    {
+        const unsigned long long w = mx_gt() - t0;
+        g_mxstat.n += 1ull; g_mxstat.sum += w;
+        if (w > g_mxstat.mx) g_mxstat.mx = w;
+        if (w >= 1000ull) g_mxstat.over += 1ull;   // a microsecond or more
+    }
+#endif
     __threadfence_system();
     pdl_trigger();   // (only after the wait: ds4_pdl.cuh)
 }
@@ -1957,6 +2021,11 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* 
     c.cpu_part = a.cpu_part;
     c.cpu_stride = (size_t) a.n_embd;
     c.cpu_flag = a.cpu_flag;
+    c.cpu_pmask = a.cpu_pmask;
+    if (a.cpu_flag != nullptr) {   // (8BM) stage both int arrays into VRAM with one PCIe read, not 2 per block
+        int* dv = comb_flags_dev(2 * kCombFlags, s, a.cpu_flag);
+        if (dv != nullptr) { c.cpu_flag = dv; c.cpu_pmask = dv + kCombFlags; }
+    }
     c.cpu_picks = a.cpu_picks;
     c.cpu_pick_stride = a.cpu_pick_stride;
     c.cpu_pmask = a.cpu_pmask;
@@ -1965,7 +2034,7 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* 
     c.out_stride = (size_t) a.n_embd;
     c.k = a.k;
     c.n_embd = a.n_embd;
-    pdl_launch(mx_combine_kernel, dim3((unsigned) ((a.n_embd + 127) / 128), 1), 128, 0, s, c);
+    pdl_launch(mx_combine_kernel, dim3((unsigned) ((a.n_embd + mx_combine_t() - 1) / mx_combine_t()), 1), mx_combine_t(), 0, s, c);
     check("moe_down");
 }
 
@@ -2015,6 +2084,10 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
     (mx_d ? q8_quant : iq_act_quant)(a.h, (size_t) a.n_ff, a.T * 8, a.n_ff, sc->hq, sc->hd, s);
     if (mx_d) launch_groups<DownK>(m, a.n_embd, groups, a.T, s);
     else iq::down(ia, groups, a.T, s);
+#ifdef MX_TRACE
+    static int mx_tick = 0;
+    if (++mx_tick % 64 == 0) mx_trace_dump();
+#endif
     if (a.wait_ptr != nullptr) pdl_launch(mx_wait_kernel, 1, 32, 0, s, a.wait_ptr, a.wait_val);
     CombArgs c{};
     c.plan_ptr = a.plan_ptr;
@@ -2023,6 +2096,11 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
     c.cpu_part = a.cpu_part;
     c.cpu_stride = a.cpu_stride != 0 ? a.cpu_stride : (size_t) a.n_embd;
     c.cpu_flag = a.cpu_flag;
+    c.cpu_pmask = a.cpu_pmask;
+    if (a.cpu_flag != nullptr) {   // (8BM) stage both int arrays into VRAM with one PCIe read, not 2 per block
+        int* dv = comb_flags_dev(2 * kCombFlags, s, a.cpu_flag);
+        if (dv != nullptr) { c.cpu_flag = dv; c.cpu_pmask = dv + kCombFlags; }
+    }
     c.cpu_picks = a.cpu_picks;
     c.cpu_pick_stride = a.cpu_pick_stride;
     c.cpu_pmask = a.cpu_pmask;
@@ -2031,7 +2109,7 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
     c.out_stride = a.out_stride;
     c.k = a.k;
     c.n_embd = a.n_embd;
-    pdl_launch(mx_combine_kernel, dim3((unsigned) ((a.n_embd + 127) / 128), (unsigned) a.T), 128, 0, s, c);
+    pdl_launch(mx_combine_kernel, dim3((unsigned) ((a.n_embd + mx_combine_t() - 1) / mx_combine_t()), (unsigned) a.T), mx_combine_t(), 0, s, c);
     check("win_experts");
     return true;
 }

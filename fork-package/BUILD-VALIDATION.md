@@ -1,0 +1,5 @@
+# Clean build and bounded validation — 2026-11-13
+
+The source fork configured and built successfully on the four-V100S host with CMake 3.31.6, CUDA 12.8.93, GCC 12.2, Release mode, `CMAKE_CUDA_ARCHITECTURES=70`, `STRATA_NATIVE_EXPERTS=ON`, `STRATA_ENABLE_CUDA=ON`, and `STRATA_BUILD_TESTS=ON`. The existing production build's llama.cpp dependency checkout was reused at revision `3cf03257f219afbe7334045ff7c6a06ac68c627d`. This was a new build directory, but is not an independent dependency fetch or a reproducible-binary proof. The system CMake 3.25.1 failed to configure CUDA C++20; CMake 3.31.6 succeeded. The generated executable SHA-256 was `2179f17e1fd89991e8f7eb6c17b9c1f734a431a9a8c20fae39a9146a72779a77`, different from the original production executable `a0cc17c94e17e398f7053947f3f062214d1e2fb410196f1cb8331add8a24429a`.
+
+Five CTest checks passed: `ds4_undo_log_test`, `ds4_logprobs_test`, `ds4_iq512_rows`, `ds4_iq512_rows_default`, and `ds4_iq_host_test`. These exercise selected CPU and logical paths, not all GPU kernels or full-model numerical equivalence.

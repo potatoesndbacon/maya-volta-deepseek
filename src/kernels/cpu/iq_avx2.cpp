@@ -475,6 +475,9 @@ inline void row_dot_iq1m(const uint8_t* row, int nblocks, const block_q8_K* cons
         const float dx = h2f(dh);
         __m256i acc16[NT], del16[NT];
         for (int t = 0; t < NT; ++t) acc16[t] = del16[t] = _mm256_setzero_si256();
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC unroll 4
+#endif
         for (int j = 0; j < 4; ++j) {
             const uint8_t* qs = block + 8 * j;
             const uint8_t* qh = block + 32 + 4 * j;

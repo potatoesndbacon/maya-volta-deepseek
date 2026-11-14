@@ -1,0 +1,77 @@
+{
+  "CMakeLists.txt": {
+    "reconstructed_sha256": "f05b4787adb5d1ac53bd81629515656fc967064642f413728f0510460afaca79",
+    "live_sha256": "f05b4787adb5d1ac53bd81629515656fc967064642f413728f0510460afaca79",
+    "match": true
+  },
+  "serve/loop_guard.py": {
+    "reconstructed_sha256": "1e82ed44cb3d4400de98b390a69b5a36989ce4751c8c84375eb4ec7a910cd6e3",
+    "live_sha256": "1e82ed44cb3d4400de98b390a69b5a36989ce4751c8c84375eb4ec7a910cd6e3",
+    "match": true
+  },
+  "serve/server.py": {
+    "reconstructed_sha256": "85281dbbbe08a574fe02679f7975d8951701287a28fd619022cf258519a0e5ef",
+    "live_sha256": "85281dbbbe08a574fe02679f7975d8951701287a28fd619022cf258519a0e5ef",
+    "match": true
+  },
+  "serve/web/monitor.js": {
+    "reconstructed_sha256": "6bb653b22c5d6815440704272253751768d8b34dd8b691d301c16402ca8d4a8a",
+    "live_sha256": "6bb653b22c5d6815440704272253751768d8b34dd8b691d301c16402ca8d4a8a",
+    "match": true
+  },
+  "src/ds4/ds4_gguf.cu": {
+    "reconstructed_sha256": "cabbdc91498787e7997f347b9cfa9ca27fa503c79a020fcdc1924d165d17c7cb",
+    "live_sha256": "cabbdc91498787e7997f347b9cfa9ca27fa503c79a020fcdc1924d165d17c7cb",
+    "match": true
+  },
+  "src/ds4/ds4_iq.cu": {
+    "reconstructed_sha256": "aeb176de63c0490ea1f6ce736cb7f775e8a1b075f33da25c00ea062db4ba9a12",
+    "live_sha256": "aeb176de63c0490ea1f6ce736cb7f775e8a1b075f33da25c00ea062db4ba9a12",
+    "match": true
+  },
+  "src/ds4/ds4_iq_cpu.cpp": {
+    "reconstructed_sha256": "350dafd1ebbc83c2bc955c1b9d5551b695270c418babde5c4c11271d882a73b4",
+    "live_sha256": "350dafd1ebbc83c2bc955c1b9d5551b695270c418babde5c4c11271d882a73b4",
+    "match": true
+  },
+  "src/ds4/ds4_kernels.cu": {
+    "reconstructed_sha256": "724ddf4db79f3788fb79e56cfc5ef27c03f620d2b3ca56734b50f1ec02ed0289",
+    "live_sha256": "724ddf4db79f3788fb79e56cfc5ef27c03f620d2b3ca56734b50f1ec02ed0289",
+    "match": true
+  },
+  "src/ds4/ds4_kernels.cuh": {
+    "reconstructed_sha256": "aad5cadf10cde15344ae830970f87cc71da1f30ab860ac3156e67cc9176863c1",
+    "live_sha256": "aad5cadf10cde15344ae830970f87cc71da1f30ab860ac3156e67cc9176863c1",
+    "match": true
+  },
+  "src/ds4/ds4_main.cpp": {
+    "reconstructed_sha256": "d442458ad8b41d28443895ce59ee3b833dd2151abc7272f38105ec5a2dcf1d2c",
+    "live_sha256": "d442458ad8b41d28443895ce59ee3b833dd2151abc7272f38105ec5a2dcf1d2c",
+    "match": true
+  },
+  "src/ds4/ds4_model.cu": {
+    "reconstructed_sha256": "43708b6ace67d1d6369721b8d472b581bd9a99f8c79e3d0ddfef5a7abdeaf668",
+    "live_sha256": "43708b6ace67d1d6369721b8d472b581bd9a99f8c79e3d0ddfef5a7abdeaf668",
+    "match": true
+  },
+  "src/ds4/ds4_model.hpp": {
+    "reconstructed_sha256": "e10b7fc7d0577cf64f8f2fccf802650f75b44095ba750d12d63b02e5aac33318",
+    "live_sha256": "e10b7fc7d0577cf64f8f2fccf802650f75b44095ba750d12d63b02e5aac33318",
+    "match": true
+  },
+  "src/ds4/ds4_undo_log.hpp": {
+    "reconstructed_sha256": "344d189321e8d76c21e0e2d7c1273a89e38608f3538f1e602c968b448c5cd871",
+    "live_sha256": "344d189321e8d76c21e0e2d7c1273a89e38608f3538f1e602c968b448c5cd871",
+    "match": true
+  },
+  "src/kernels/cpu/iq_avx2.cpp": {
+    "reconstructed_sha256": "9d3816c4d91df6231dacab733488fa3e6319047aef980f2a6003f095f227aec9",
+    "live_sha256": "9d3816c4d91df6231dacab733488fa3e6319047aef980f2a6003f095f227aec9",
+    "match": true
+  },
+  "tests/ds4_undo_log_test.cpp": {
+    "reconstructed_sha256": "a89cd57e9b22ece9eff0a2f0f03b9dd18d432d715e9a2ad98fae31c56e218bd8",
+    "live_sha256": "a89cd57e9b22ece9eff0a2f0f03b9dd18d432d715e9a2ad98fae31c56e218bd8",
+    "match": true
+  }
+}

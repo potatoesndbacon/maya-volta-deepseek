@@ -36,6 +36,33 @@
 #include "strata/spec/suffix_drafter.hpp"
 
 #include <cuda_profiler_api.h>
+#if __has_include(<nvtx3/nvToolsExt.h>)
+#include <nvtx3/nvToolsExt.h>
+#define MAYA_HAVE_NVTX 1
+#else
+#define MAYA_HAVE_NVTX 0
+#endif
+
+namespace {
+struct MayaDecodeTrace {
+    bool on = std::getenv("DS4_TRACE_DECODE") != nullptr;
+    int warm = std::max(0, std::getenv("DS4_TRACE_WARMUP") ? std::atoi(std::getenv("DS4_TRACE_WARMUP")) : 8);
+    int steps = std::max(1, std::getenv("DS4_TRACE_STEPS") ? std::atoi(std::getenv("DS4_TRACE_STEPS")) : 64);
+    int count = 0;
+    bool active = false;
+    bool begin() {
+        if (!on || active || count < warm) return false;
+        active = true;
+        cudaProfilerStart();
+        return true;
+    }
+    void end() {
+        if (!active) return;
+        ++count;
+        if (count - warm >= steps) { cudaProfilerStop(); active = false; }
+    }
+};
+}
 
 // the commit and the release this binary was built from (--version, the --verbose "ds4: build" line):
 // cmake/build_id.cmake writes them at every build
@@ -1155,6 +1182,24 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         note(msg);
         return len;
     };
+    // DS4_UNDO_FIRST: the largest prefix a kept conversation *could* restore this prompt to, without loading it - the
+    // probe the in-place rewind compares the bound conversation's undo-log limit against (slot_take's loop, no load)
+    const auto slot_probe = [&](const std::vector<int>& prompt, const std::vector<Pic>& want) -> size_t {
+        size_t best = 0;
+        if (slot_max <= 0 || prompt.size() < 2) return 0;
+        for (size_t i = 0; i < slots.size(); ++i) {
+            const auto& t = slots[i].tokens;
+            const size_t lim = std::min(t.size(), prompt.size() - 1);
+            size_t c = 0;
+            while (c < lim && t[c] == prompt[c]) ++c;
+            size_t u = c == t.size() ? c : 0;
+            if (u == 0)
+                for (int64_t k : slots[i].cks)
+                    if ((size_t) k <= c && (size_t) k > u) u = (size_t) k;
+            if (u > best && pics_match(slots[i].pics, want, u)) best = u;
+        }
+        return best;
+    };
     // SHARED STARTS (#607): the state at the end of a system prompt and its tools (the shared= restore point of a
     // prompt read from token 0) is also kept apart from its conversation, in RAM, so a NEW conversation behind the same
     // start - after an unrelated one, in another --parallel conversation, with or without MAYA_DS4_SLOT_KEEP - takes it
@@ -1422,6 +1467,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             std::snprintf(b, sizeof b, " skip_on=%d", s.skip_on);
             out += b;
         }
+        if (s.undo_hits > 0 || s.undo_misses > 0) {   // DS4_UNDO_LOG: this run's rewind log (cumulative since start)
+            std::snprintf(b, sizeof b, " undo_hits=%lld undo_reused=%lld undo_rewound=%lld undo_misses=%lld",
+                          (long long) s.undo_hits, (long long) s.undo_reused, (long long) s.undo_rewound,
+                          (long long) s.undo_misses);
+            out += b;
+        }
         return out;
     };
     // a request's prompt into the bound conversation (one conversation's requests and --parallel's alike), in three
@@ -1501,18 +1552,32 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             // CONVERSATION SLOTS: this prompt does not continue the conversation in the model - that one is set aside
             // first (another one takes the model, and its state is lost otherwise), then the kept conversation this
             // prompt does continue is taken back - if it goes further back than the checkpoints the state itself holds
-            if (slot_max > 0) slot_put("");
-            beat();
             const int64_t limit = (int64_t) std::min(c, r.ids.size() - 1);
             const int64_t rs = m.restorable(limit);
-            bool whole = false;
-            // (a kept shared start, when it covers more than the state itself can go back to; a kept conversation
-            //  only when it covers more than either)
-            const int pi = abl ? -1 : prefix_find(r.ids, pics, rs > 0 ? (size_t) rs : 0);
-            const size_t plen = pi >= 0 ? prefixes[(size_t) pi].tokens.size() : 0;
-            const size_t back = abl ? 0 : slot_take(r.ids, pics, std::max(rs > 0 ? (size_t) rs : 0, plen), whole);
+            // DS4_UNDO_FIRST (prototype): when the undo log covers the bound conversation's exact prefix and no kept
+            // conversation matches more, rewind it in place - skipping the full-state slot_put copy and the
+            // slot/prefix round trip (the state is not parked: an edit discards the tail it would have kept).
+            static const bool undo_first = std::getenv("DS4_UNDO_FIRST") != nullptr &&
+                                           std::atoi(std::getenv("DS4_UNDO_FIRST")) != 0;
+            const bool in_place = undo_first && limit > 0 && rs == limit &&
+                                  (size_t) limit >= slot_probe(r.ids, pics);
+            if (!in_place && slot_max > 0) slot_put("");
             beat();
-            if (back > 0) {
+            bool whole = false;
+            int pi = -1;
+            size_t plen = 0, back = 0;
+            if (!in_place) {
+                // (a kept shared start, when it covers more than the state itself can go back to; a kept conversation
+                //  only when it covers more than either)
+                pi = abl ? -1 : prefix_find(r.ids, pics, rs > 0 ? (size_t) rs : 0);
+                plen = pi >= 0 ? prefixes[(size_t) pi].tokens.size() : 0;
+                back = abl ? 0 : slot_take(r.ids, pics, std::max(rs > 0 ? (size_t) rs : 0, plen), whole);
+                beat();
+            }
+            if (in_place) {
+                if (m.restore(limit)) from = (size_t) m.pos();
+                else { m.reset(); from = 0; }
+            } else if (back > 0) {
                 from = back;
                 continued = whole;
             } else if (pi >= 0 && prefix_take(pi)) {
@@ -2062,6 +2127,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         double busy_t1 = 0;
         long long busy_n = 0, busy_io = -1;
         strata::ds4::Stats busy_s;
+        MayaDecodeTrace decode_trace;
         std::string err;
         std::fprintf(stderr, "maya ds4 serve: %d conversations at once (--parallel): GEN needs rid=<id>; STOP <rid>\n",
                      nseq);
@@ -2469,6 +2535,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                         sv.push_back(a->seq);
                         tv.push_back(a->tok);
                     }
+                    const bool trace_step = decode_trace.begin();
+#if MAYA_HAVE_NVTX
+                    if (trace_step) nvtxRangePushA("MAYA_TOKEN_STEP");
+#endif
                     if (!m.step_multi(sv.data(), tv.data(), nn, err)) cancel_all();
                     else {
                         for (int i = 0; i < nn; ++i) {
@@ -2483,6 +2553,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                         }
                         stepped = true;
                     }
+                    if (trace_step) {
+#if MAYA_HAVE_NVTX
+                        nvtxRangePop();
+#endif
+                        decode_trace.end();
+                    } else if (decode_trace.on && !decode_trace.active) ++decode_trace.count;
                 } else {
                     std::vector<std::vector<int>> rows((size_t) nn);
                     std::vector<const int*> tp((size_t) nn);
@@ -2494,6 +2570,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                         lens[(size_t) i] = (int) rows[(size_t) i].size();
                         sv[(size_t) i] = need[(size_t) i]->seq;
                     }
+                    const bool trace_step = decode_trace.begin();
+#if MAYA_HAVE_NVTX
+                    if (trace_step) nvtxRangePushA("MAYA_TOKEN_STEP");
+#endif
                     if (!m.step_multi_spec(sv.data(), tp.data(), lens.data(), nn, err)) cancel_all();
                     else
                         for (int i = 0; i < nn; ++i) {
@@ -2520,6 +2600,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                             if (a.r.logprobs >= 0) a.got_lp = lp_take(m, a.got.size());
                             next_tok(a);
                         }
+                    if (trace_step) {
+#if MAYA_HAVE_NVTX
+                        nvtxRangePop();
+#endif
+                        decode_trace.end();
+                    } else if (decode_trace.on && !decode_trace.active) ++decode_trace.count;
                 }
                 if (sp != nullptr && stepped) {   // (DS4_DRAFT_COST: the step's time by its rows in all)
                     int rows_all = 0;

@@ -1,0 +1,2540 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 09c2fc3..09dc761 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -260,6 +260,10 @@ if(STRATA_BUILD_TESTS)
+   add_executable(ds4_marks_test tests/ds4_marks_test.cpp)
+   target_link_libraries(ds4_marks_test PRIVATE strata_warnings)
+   add_test(NAME ds4_marks_test COMMAND ds4_marks_test)
++  # maya-ds4's undo log (DS4_UNDO_LOG): the overwritten-slot replay contract restore() implements
++  add_executable(ds4_undo_log_test tests/ds4_undo_log_test.cpp)
++  target_link_libraries(ds4_undo_log_test PRIVATE strata_warnings)
++  add_test(NAME ds4_undo_log_test COMMAND ds4_undo_log_test)
+   # maya-ds4's log-probabilities (GEN logprobs=): the reference, the penalties, ties, the kernel's pieces, the LP line
+   add_executable(ds4_logprobs_test tests/ds4_logprobs_test.cpp)
+   target_link_libraries(ds4_logprobs_test PRIVATE strata_warnings)
+diff --git a/serve/loop_guard.py b/serve/loop_guard.py
+index 9b27bea..84d7d56 100644
+--- a/serve/loop_guard.py
++++ b/serve/loop_guard.py
+@@ -301,6 +301,8 @@ TOOL_WINDOW = 12        # the last this many tool calls since the user's last me
+ TOOL_REPS = 3           # ... hold the last one (name, arguments and result the same) this many times: a loop
+ TOOL_NUDGES = 3         # notes (tool_note) before the server stops running it: then the call itself is blocked
+ TOOL_BLOCK = TOOL_REPS + TOOL_NUDGES - 1   # (made this many times: TOOL_NUDGES notes went by, unheeded)
++TOOL_REPS_ANY = int(os.environ.get("MAYA_LOOP_TOOL_REPS_ANY") or 6)    # ... made this many times in all: a loop
++TOOL_BLOCK_ANY = int(os.environ.get("MAYA_LOOP_TOOL_BLOCK_ANY") or 9)  # ... this many in all: the call itself blocked
+ BLOCK_HEAT = 0.15       # each blocked attempt in one answer after the first: the temperature this much higher ...
+ BLOCK_HEAT_MAX = 1.5    # ... up to this (off its track: the same call again and again is the model's surest path)
+ 
+@@ -376,6 +378,27 @@ def _tool_calls(messages: list[dict]) -> list[tuple]:
+     return calls
+ 
+ 
++def _all_tool_calls(messages: list[dict]) -> list[tuple]:
++    """(name, arguments) of every tool call the conversation holds, the user's own messages NOT resetting the count:
++    a client that re-sends the whole conversation each round (an agent loop) carries every call it has made."""
++    out, pending = [], []
++    for m in messages:
++        role = m.get("role")
++        if role == "assistant":
++            pending = [((c.get("function") or c).get("name"), args_key((c.get("function") or c).get("arguments")))
++                       for c in m.get("tool_calls") or []]
++        elif role == "tool" and pending:
++            out.append(pending.pop(0))
++        elif role == "user":
++            pending = []        # (a call whose result never came is not counted)
++    return out
++
++
++def _times_any(messages: list[dict], call: tuple) -> int:
++    """How often this (name, arguments) appears in the whole conversation, whatever each result said."""
++    return sum(1 for x in _all_tool_calls(messages) if x == call)
++
++
+ def _times(window: list[tuple], c: tuple) -> int:
+     """How often call c counts as made among `window`: with the same result - or, the calls just before it in a row
+     (nothing else in between), with a result that differs only in numbers or garbled bytes (a check run again and
+@@ -397,13 +420,25 @@ def tool_repeat(messages: list[dict]) -> ToolRepeat | None:
+     results: is the last call one the model made TOOL_REPS times among its last TOOL_WINDOW since the user's last
+     message, with the same arguments, and got the same result each time (_times)?  A command run again after an edit
+     gives another result, a poll that finally changes another one too: neither counts."""
+-    if not messages or messages[-1].get("role") != "tool":
++    if not messages:
+         return None
+     calls = _tool_calls(messages)
+-    if not calls:
++    if calls and messages[-1].get("role") == "tool":
++        times = _times(calls[-TOOL_WINDOW:], calls[-1])
++        if times >= TOOL_REPS:
++            return ToolRepeat(str(calls[-1][0]), times)
++    # (8T.4) the same call again and again over the conversation, whatever its results said and wherever the user's
++    # own turns fall: a meta-tool whose error text changes never matches on the result, and one that a client wraps in
++    # a user message resets the windowed count above.  Only consulted while the model is still in the tool loop (the
++    # last message a tool result or the user's), never for a conversation that has moved on to a plain answer.
++    if messages[-1].get("role") not in ("tool", "user"):
++        return None
++    allc = _all_tool_calls(messages)
++    if not allc:
+         return None
+-    times = _times(calls[-TOOL_WINDOW:], calls[-1])
+-    return ToolRepeat(str(calls[-1][0]), times) if times >= TOOL_REPS else None
++    last = allc[-1]
++    anyr = sum(1 for x in allc if x == last)
++    return ToolRepeat(str(last[0]), anyr) if anyr >= TOOL_REPS_ANY else None
+ 
+ 
+ def tool_blocked(messages: list[dict]) -> dict[tuple[str, str], ToolRepeat]:
+@@ -414,8 +449,17 @@ def tool_blocked(messages: list[dict]) -> dict[tuple[str, str], ToolRepeat]:
+     out = {}
+     for c in window:
+         t = _times(window, c)
++        n = _times_any(messages, c[:2])
++        if n >= TOOL_BLOCK_ANY:
++            t = max(t, n)   # (8T.4: the same round, its results varying, past TOOL_NUDGES of its notes)
+         if t >= TOOL_BLOCK and t > out.get(c[:2], ToolRepeat("", 0)).times:
+             out[c[:2]] = ToolRepeat(str(c[0]), t)
++    # (8T.4) the whole conversation, for a client that puts its own turns between the rounds: the windowed count above
++    # then sees nothing at all, while every round it re-sends is still there
++    for call in set(_all_tool_calls(messages)):
++        n = _times_any(messages, call)
++        if n >= TOOL_BLOCK_ANY and n > out.get(call, ToolRepeat("", 0)).times:
++            out[call] = ToolRepeat(str(call[0]), n)
+     return {(str(k[0]), k[1]): v for k, v in out.items()}
+ 
+ 
+diff --git a/serve/server.py b/serve/server.py
+index 1357b76..1be6339 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -3327,7 +3327,18 @@ class Service:
+                                                "cpu", "ram", "disk_mb", "engram_ms")}}   # (the last four: DeepSeek's)
+         hw = dict(tel["now"])
+         cards = hw.pop("vram", None)                      # (each card's processes: for the GPU map only)
++        # prefill reuse, split: the undo log's share (DS4_UNDO_LOG, from the engine's STAT counters) vs the slot cache /
++        # shared prefix (the rest of totals.reused).  undo_reused is the kept prefix of each rewind; slot_reused is the
++        # remainder - the tokens a continuation, a kept conversation or a shared start reused.
++        st = stat or {}
++        undo_reused = int(st.get("undo_reused", 0) or 0)
++        reuse = {"reused": totals.get("reused", 0), "undo_reused": undo_reused,
++                 "undo_rewound": int(st.get("undo_rewound", 0) or 0),
++                 "undo_hits": int(st.get("undo_hits", 0) or 0),
++                 "undo_misses": int(st.get("undo_misses", 0) or 0),
++                 "slot_reused": max(0, totals.get("reused", 0) - undo_reused)}
+         return {"engine": engine, "live": live, "tiers": tiers, "gpu_map": self._gpu_map(cards),
++                "reuse": reuse,
+                 "requests": hist[::-1][:None if all_requests else 12],
+                 "requests_kept": len(hist), "totals": totals, "loop_guard": guard, "hardware": hw,
+                 "hardware_static":
+@@ -6206,6 +6217,9 @@ def make_handler(svc: Service):
+                 if path == "/api/tokens":                    # the context meter: a prompt's size, nothing run
+                     self._json(200, svc.count_tokens(req))
+                     return
++                if path == "/v1/sweep":                      # one resident prefix, N tails: the undo log's regime
++                    self._sweep(req)
++                    return
+                 if path == "/tokenize":                      # llama.cpp's and vLLM's: a text's or a prompt's ids
+                     self._json(200, svc.tokenize(req))
+                     return
+@@ -6522,6 +6536,68 @@ def make_handler(svc: Service):
+                 if emb:
+                     Path(emb).unlink(missing_ok=True)
+ 
++        def _chat_once(self, req):
++            """One non-streaming chat completion's full response dict.  The same steps _openai takes for a non-stream
++            request (openai_chunks -> openai_collect), so prefix reuse - the slot cache and the undo log - behaves
++            exactly as it does for a normal request.  Used by /v1/sweep to issue N tails against one live prefix."""
++            req = svc.with_shared(req, "openai")
++            req["_api"] = "openai"
++            svc.check_request(req)
++            messages, tools, kw = openai_to_messages(req, deepseek=getattr(svc.template, "deepseek", False),
++                                                     glm_dsa=getattr(svc.template, "glm_dsa", False))
++            max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)
++            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, guard=svc._loop_guard_on(req))
++            req = {**req, "_blocked": kw.get("_blocked"), "_think_resume": kw.get("_think_resume")}
++            req = {**req, "_think_max": kw.get("_think_max")}
++            cancel = threading.Event()
++            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel)
++            try:
++                return openai_collect(chunks)
++            finally:
++                chunks.close()
++
++        def _sweep(self, req):
++            """POST /v1/sweep {prefix, tails[], max_tokens, temperature}: read one long prefix once, then answer each
++            tail against it.  Requests 2..N share the prefix with the live state, so the engine rewinds the previous
++            tail through the undo log (DS4_UNDO_LOG) instead of re-reading the prefix - the workload the log exists
++            for, at N>2.  Returns per-tail usage/reuse and the run's undo counters; the log is earning its keep when
++            undo.reused is a large share of the prefix (the 'ton' regime of MAYA-UNDO-LOG-USES section 11)."""
++            try:
++                prefix = str(req.get("prefix") or "")
++                tails = req.get("tails") or []
++                if not prefix or not isinstance(tails, list) or not tails:
++                    raise ValueError("send a non-empty 'prefix' and a non-empty 'tails' list")
++                model = req.get("model") or svc.model
++                max_tokens = int(req.get("max_tokens") or 32)
++                temperature = float(req.get("temperature") or 0.0)
++            except (TypeError, ValueError) as e:
++                self._json(400, error_body(e))
++                return
++            keys = ("undo_hits", "undo_misses", "undo_reused", "undo_rewound")
++            def counters():
++                st = getattr(svc.engine, "stat", None) or {}
++                return {k: int(st.get(k, 0) or 0) for k in keys}
++            u0 = counters()
++            rows = []
++            for i, tail in enumerate(tails):
++                r = {"model": model, "messages": [{"role": "user", "content": prefix + "\n" + str(tail)}],
++                     "max_tokens": max_tokens, "temperature": temperature, "stream": False}
++                t0 = time.monotonic()
++                try:
++                    out = self._chat_once(r)
++                except Exception as e:                     # one bad tail must not end the sweep
++                    rows.append({"i": i, "error": f"{type(e).__name__}: {e}"})
++                    continue
++                u = out.get("usage") or {}
++                pd = u.get("prompt_tokens_details") or {}
++                rows.append({"i": i, "prompt_tokens": u.get("prompt_tokens"),
++                             "cached_tokens": pd.get("cached_tokens"),
++                             "completion_tokens": u.get("completion_tokens"),
++                             "wall_s": round(time.monotonic() - t0, 3)})
++            u1 = counters()
++            self._json(200, {"model": model, "prefix_chars": len(prefix), "tails": len(tails), "rows": rows,
++                             "undo": {k: u1[k] - u0[k] for k in keys}})
++
+         def _openai(self, req):
+             req = svc.with_shared(req, "openai")
+             req["_api"] = "web" if req.get("strata_resume") is True else "openai"   # the Monitor's request table
+diff --git a/serve/web/monitor.js b/serve/web/monitor.js
+index 9fc86b5..771a0cd 100644
+--- a/serve/web/monitor.js
++++ b/serve/web/monitor.js
+@@ -207,6 +207,31 @@ function ContextCard({m}) {
+   </section>`;
+ }
+ 
++// ------------------------------------------------------------------ prefill reuse: slot/prefix vs the undo log
++// the server's /metrics "reuse": the tokens kept instead of re-read, split into the slot cache / shared prefix and the
++// undo log (DS4_UNDO_LOG, from the engine's STAT counters), with the log's rewind count, tokens and misses.
++function ReuseCard({m}) {
++  const r = m && m.reuse;
++  if (!r) return null;
++  const total = r.reused || 0, undo = Math.min(r.undo_reused || 0, total), slot = Math.max(0, total - undo);
++  const prompt = (m.totals || {}).prompt_tokens || 0, read = Math.max(0, prompt - total);
++  const all = prompt ? (100 * total) / prompt : 0;
++  const allTxt = !prompt ? "0" : all >= 99.95 ? "≥99.9" : all.toFixed(all < 10 ? 2 : 1);
++  const pct = (n) => (total ? Math.round((100 * n) / total) : 0);
++  return html`<section class="card" aria-label="Prefill reuse">
++    <div class="card__head"><span class="card__title">Prefill reuse</span>
++      <span class="card__sub">${allTxt}% of prompt tokens kept instead of re-read · ${fmt(read)} read, since start</span></div>
++    <div class="ctx__nums"><span class="ctx__big num">${fmt(total)}<small> tokens</small></span>
++      <span class="ctx__pct num"><b>${pct(slot)}%</b> slot · <b>${pct(undo)}%</b> undo log</span></div>
++    <div class="legend">
++      <span><i class="sw sw--reused"></i>Slot / shared prefix <b class="num">${fmt(slot)}</b></span>
++      <span><i class="sw sw--fresh"></i>Undo log <b class="num">${fmt(undo)}</b></span>
++      <span><i class="sw sw--free"></i>Rewinds <b class="num">${fmt(r.undo_hits || 0)}</b> · ${fmt(r.undo_rewound || 0)} tok · ${fmt(r.undo_misses || 0)} miss</span>
++    </div>
++    <p class="card__note card__note--tip">The undo log rewinds a prompt-tail edit within <b>DS4_UNDO_LOG</b> tokens (host-pinned, 16 K); slot / shared prefix is a continued or kept conversation, or a shared start. Unset DS4_UNDO_LOG = no undo-log line.</p>
++  </section>`;
++}
++
+ // ------------------------------------------------------------------ where the experts live (the engine's STAT lines)
+ // GLM's engine: where each routed expert came from while the model writes; DeepSeek's (maya-ds4): the experts the CPU lane
+ // computed, what the storage read, the cache's moves and the n-gram memory (Engram) a token; MiniMax's (maya-mm3): the
+@@ -616,6 +641,7 @@ export function MonitorPage() {
+         <${Banners} m=${m}/>
+         <div class="mon__top"><${Throughput} m=${m}/><${RightNow} m=${m}/></div>
+         <${ContextCard} m=${m}/>
++        <${ReuseCard} m=${m}/>
+         <${Tiers} t=${m.tiers} eng=${m.engine || {}}/>
+         <${GpuMap} m=${m}/>
+         <${Hardware} m=${m} gpuEach=${gpuEach}/>
+diff --git a/src/ds4/ds4_gguf.cu b/src/ds4/ds4_gguf.cu
+index 968610b..d9162dc 100644
+--- a/src/ds4/ds4_gguf.cu
++++ b/src/ds4/ds4_gguf.cu
+@@ -912,6 +912,40 @@ __global__ void __launch_bounds__(kThreads) mx_down_kernel(const MxArgs a) {
+     }
+ }
+ 
++// (Phase 8BE) STRATA_DS4_COMBINE_THREADS: the MoE combine's block size. A decode step's combine is 5 120 floats
++// against six strided partial rows; at 128 threads that is a 40-block grid - under one block an SM - and each
++// thread's six loads have almost no concurrency to hide DRAM latency behind (55 us a launch, 10.3 % of kernel
++// time, for ~140 KB of traffic that should take a fraction of a microsecond). Smaller blocks spread the same
++// threads over more SMs.
++static int mx_combine_t() {
++    static const int n = [] {
++        const char* v = std::getenv("STRATA_DS4_COMBINE_THREADS");
++        int t = v != nullptr ? std::atoi(v) : 0;
++        if (t < 32) t = 128;
++        return std::min(256, (t / 32) * 32);
++    }();
++    return n;
++}
++
++// (Phase 8BM) cpu_flag / cpu_pmask live in `Resp`, which is cudaHostAllocMapped - so the combine's first act is two
++// PCIe round trips PER BLOCK (80 a launch at 40 blocks), each stalling before its __syncthreads. Measured on a
++// standalone replica: 12.7 us with those two ints in device memory, 55.9 us with them host-mapped, and the engine
++// reports 43.4. One block reads them over PCIe and publishes to a device copy; every block then reads VRAM.
++static constexpr int kCombFlags = 16;  // (8BM) = kWin (ds4_kernels.cuh:21): Resp.s cpu[] and pmask[] are each this long
++__global__ void comb_flags_kernel(const int* __restrict__ hsrc, int* __restrict__ dst, int n) {
++    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = hsrc[i];
++}
++static int* comb_flags_dev(int n, cudaStream_t s, const int* hsrc) {
++    static int* buf[64] = {nullptr};
++    int dev = 0; cudaGetDevice(&dev);
++    if (dev < 0 || dev >= 64) return nullptr;
++    if (buf[dev] == nullptr) {
++        if (cudaMalloc(&buf[dev], sizeof(int) * 2 * kCombFlags) != cudaSuccess) { buf[dev] = nullptr; return nullptr; }
++    }
++    pdl_launch(comb_flags_kernel, 1, 32, 0, s, hsrc, buf[dev], n);
++    return buf[dev];
++}
++
+ struct CombArgs {
+     const unsigned long long* plan_ptr;   // [T][8]
+     const float* plan_w;                  // [T][8]
+@@ -930,10 +964,10 @@ struct CombArgs {
+ // grid (n_embd / 128, T): each token's outputs - the experts in plan order (an expert off the device adds 0, or its
+ // CPU-lane part when cpu_pmask says the lane answered it: the same place in the sum either way), then the CPU lane's
+ // summed part and the shared expert's (x3's combine)
+-__global__ void __launch_bounds__(128) mx_combine_kernel(const CombArgs a) {
++__global__ void __launch_bounds__(256) mx_combine_kernel(const CombArgs a) {
+     pdl_wait();
+     pdl_trigger();
+-    const int t = blockIdx.y, r = blockIdx.x * 128 + threadIdx.x;
++    const int t = blockIdx.y, r = blockIdx.x * blockDim.x + threadIdx.x;   // (8BE) blockDim, not a fixed 128
+     // (the pick mask from the host's answer, read once a block: host-mapped, every thread's own read of it cost the
+     //  kernel ~10x its time on two RTX PRO 6000s)
+     __shared__ int s_pm, s_cf;
+@@ -957,14 +991,44 @@ __global__ void __launch_bounds__(128) mx_combine_kernel(const CombArgs a) {
+                 a.sh_out != nullptr ? a.sh_out[(size_t) t * a.n_embd + r] : 0.0f);
+ }
+ 
++// #define MX_TRACE 1   // (Phase 8AJ) CPU-lane handshake timing; absent in production builds
++#ifdef MX_TRACE
++struct MxStat { unsigned long long n, sum, mx, over; };
++__device__ MxStat g_mxstat = {0, 0, 0, 0};
++static __device__ __forceinline__ unsigned long long mx_gt() { unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); return t; }
++static void mx_trace_dump() {
++    std::fprintf(stderr, "mxtrace:");
++    for (int d = 0; d < 4; ++d) {
++        int cur = 0; cudaGetDevice(&cur);
++        if (cudaSetDevice(d) != cudaSuccess) { cudaSetDevice(cur); continue; }
++        MxStat h{}; cudaMemcpyFromSymbol(&h, g_mxstat, sizeof(h));
++        cudaSetDevice(cur);
++        if (h.n) std::fprintf(stderr, " dev%d n=%llu mean=%lluns max=%lluns over1us=%llu", d, h.n, h.sum / h.n, h.mx, h.over);
++        else std::fprintf(stderr, " dev%d n=0", d);
++    }
++    std::fprintf(stderr, "\n");
++}
++#endif
++
+ __global__ void mx_wait_kernel(const unsigned* p, unsigned v) {
+     pdl_wait();
+     if (threadIdx.x != 0) return;
++#ifdef MX_TRACE
++    const unsigned long long t0 = mx_gt();
++#endif
+     while (*(volatile const unsigned*) p != v) {
+ #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+         __nanosleep(200);
+ #endif
+     }
++#ifdef MX_TRACE
++    {
++        const unsigned long long w = mx_gt() - t0;
++        g_mxstat.n += 1ull; g_mxstat.sum += w;
++        if (w > g_mxstat.mx) g_mxstat.mx = w;
++        if (w >= 1000ull) g_mxstat.over += 1ull;   // a microsecond or more
++    }
++#endif
+     __threadfence_system();
+     pdl_trigger();   // (only after the wait: ds4_pdl.cuh)
+ }
+@@ -1957,6 +2021,11 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float*
+     c.cpu_part = a.cpu_part;
+     c.cpu_stride = (size_t) a.n_embd;
+     c.cpu_flag = a.cpu_flag;
++    c.cpu_pmask = a.cpu_pmask;
++    if (a.cpu_flag != nullptr) {   // (8BM) stage both int arrays into VRAM with one PCIe read, not 2 per block
++        int* dv = comb_flags_dev(2 * kCombFlags, s, a.cpu_flag);
++        if (dv != nullptr) { c.cpu_flag = dv; c.cpu_pmask = dv + kCombFlags; }
++    }
+     c.cpu_picks = a.cpu_picks;
+     c.cpu_pick_stride = a.cpu_pick_stride;
+     c.cpu_pmask = a.cpu_pmask;
+@@ -1965,7 +2034,7 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float*
+     c.out_stride = (size_t) a.n_embd;
+     c.k = a.k;
+     c.n_embd = a.n_embd;
+-    pdl_launch(mx_combine_kernel, dim3((unsigned) ((a.n_embd + 127) / 128), 1), 128, 0, s, c);
++    pdl_launch(mx_combine_kernel, dim3((unsigned) ((a.n_embd + mx_combine_t() - 1) / mx_combine_t()), 1), mx_combine_t(), 0, s, c);
+     check("moe_down");
+ }
+ 
+@@ -2015,6 +2084,10 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
+     (mx_d ? q8_quant : iq_act_quant)(a.h, (size_t) a.n_ff, a.T * 8, a.n_ff, sc->hq, sc->hd, s);
+     if (mx_d) launch_groups<DownK>(m, a.n_embd, groups, a.T, s);
+     else iq::down(ia, groups, a.T, s);
++#ifdef MX_TRACE
++    static int mx_tick = 0;
++    if (++mx_tick % 64 == 0) mx_trace_dump();
++#endif
+     if (a.wait_ptr != nullptr) pdl_launch(mx_wait_kernel, 1, 32, 0, s, a.wait_ptr, a.wait_val);
+     CombArgs c{};
+     c.plan_ptr = a.plan_ptr;
+@@ -2023,6 +2096,11 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
+     c.cpu_part = a.cpu_part;
+     c.cpu_stride = a.cpu_stride != 0 ? a.cpu_stride : (size_t) a.n_embd;
+     c.cpu_flag = a.cpu_flag;
++    c.cpu_pmask = a.cpu_pmask;
++    if (a.cpu_flag != nullptr) {   // (8BM) stage both int arrays into VRAM with one PCIe read, not 2 per block
++        int* dv = comb_flags_dev(2 * kCombFlags, s, a.cpu_flag);
++        if (dv != nullptr) { c.cpu_flag = dv; c.cpu_pmask = dv + kCombFlags; }
++    }
+     c.cpu_picks = a.cpu_picks;
+     c.cpu_pick_stride = a.cpu_pick_stride;
+     c.cpu_pmask = a.cpu_pmask;
+@@ -2031,7 +2109,7 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
+     c.out_stride = a.out_stride;
+     c.k = a.k;
+     c.n_embd = a.n_embd;
+-    pdl_launch(mx_combine_kernel, dim3((unsigned) ((a.n_embd + 127) / 128), (unsigned) a.T), 128, 0, s, c);
++    pdl_launch(mx_combine_kernel, dim3((unsigned) ((a.n_embd + mx_combine_t() - 1) / mx_combine_t()), (unsigned) a.T), mx_combine_t(), 0, s, c);
+     check("win_experts");
+     return true;
+ }
+diff --git a/src/ds4/ds4_iq.cu b/src/ds4/ds4_iq.cu
+index 275ff61..a1e9735 100644
+--- a/src/ds4/ds4_iq.cu
++++ b/src/ds4/ds4_iq.cu
+@@ -1210,6 +1210,31 @@ __global__ void __launch_bounds__(kThreads) mv_kernel(const Jobs J) {
+     float acc[NC];
+ #pragma unroll
+     for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
++    // Fast path for the common full-width IQ1_M GEMV.  The dispatch uses
++    // NC=16 for the production path and ncol is normally exactly 16; avoid
++    // carrying the per-column bounds predicate through every quantized block.
++    if constexpr (NC == 16) {
++        if (b.ncol == 16) {
++            for (int kb = lane; kb < nsb; kb += 32) {
++                Sub s;
++                decode<T>(w, kb, tab, s);
++#pragma unroll
++                for (int c = 0; c < 16; ++c) {
++                    const int4* xp = (const int4*) (b.xq + (size_t) c * b.k + (size_t) kb * 32);
++                    if constexpr (T == kQ6_K)
++                        acc[c] = fmaf(__ldg(b.xd + (size_t) c * nsb + kb), sub_dot<T>(s, __ldg(xp), __ldg(xp + 1)), acc[c]);
++                    else
++                        acc[c] = fmaf(b.xd[(size_t) c * nsb + kb], sub_dot<T>(s, xp[0], xp[1]), acc[c]);
++                }
++            }
++#pragma unroll
++            for (int c = 0; c < 16; ++c) {
++                const float v = warp_sum(acc[c]);
++                if (lane == 0) b.y[c * b.ycs + row] = b.alpha * v + (b.bias != nullptr ? b.bias[row] : 0.0f);
++            }
++            return;
++        }
++    }
+     for (int kb = lane; kb < nsb; kb += 32) {
+         Sub s;
+         decode<T>(w, kb, tab, s);
+@@ -1217,7 +1242,10 @@ __global__ void __launch_bounds__(kThreads) mv_kernel(const Jobs J) {
+         for (int c = 0; c < NC; ++c)
+             if (c < b.ncol) {
+                 const int4* xp = (const int4*) (b.xq + (size_t) c * b.k + (size_t) kb * 32);
+-                acc[c] = fmaf(b.xd[(size_t) c * nsb + kb], sub_dot<T>(s, xp[0], xp[1]), acc[c]);
++                if constexpr (T == kQ6_K)
++                    acc[c] = fmaf(__ldg(b.xd + (size_t) c * nsb + kb), sub_dot<T>(s, __ldg(xp), __ldg(xp + 1)), acc[c]);
++                else
++                    acc[c] = fmaf(b.xd[(size_t) c * nsb + kb], sub_dot<T>(s, xp[0], xp[1]), acc[c]);
+             }
+     }
+ #pragma unroll
+diff --git a/src/ds4/ds4_iq_cpu.cpp b/src/ds4/ds4_iq_cpu.cpp
+index a5dd980..ee412b0 100644
+--- a/src/ds4/ds4_iq_cpu.cpp
++++ b/src/ds4/ds4_iq_cpu.cpp
+@@ -1102,12 +1102,17 @@ void iq_cpu_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, cons
+         const int nr = r1 - r0;
+         thread_local std::vector<float> buf;
+         thread_local std::vector<float*> go, uo;
++        static thread_local int layout_nt = 0, layout_nr = 0;
+         buf.resize((size_t) 2 * nt * nr);
+-        go.resize((size_t) nt);
+-        uo.resize((size_t) nt);
+-        for (int t = 0; t < nt; ++t) {
+-            go[(size_t) t] = buf.data() + (size_t) t * nr;
+-            uo[(size_t) t] = buf.data() + (size_t) (nt + t) * nr;
++        if (layout_nt != nt || layout_nr != nr) {
++            go.resize((size_t) nt);
++            uo.resize((size_t) nt);
++            for (int t = 0; t < nt; ++t) {
++                go[(size_t) t] = buf.data() + (size_t) t * nr;
++                uo[(size_t) t] = buf.data() + (size_t) (nt + t) * nr;
++            }
++            layout_nt = nt;
++            layout_nr = nr;
+         }
+         own_rows(f.tg, gate, f.gu_row, f.n_embd, act, nt, go.data(), r0, r1);
+         own_rows(f.tg, up, f.gu_row, f.n_embd, act, nt, uo.data(), r0, r1);
+diff --git a/src/ds4/ds4_kernels.cu b/src/ds4/ds4_kernels.cu
+index 7a951fc..0a3dd21 100644
+--- a/src/ds4/ds4_kernels.cu
++++ b/src/ds4/ds4_kernels.cu
+@@ -278,7 +278,7 @@ __device__ __forceinline__ void finish_vec(float* v, int len, const Finish& f, i
+     }
+     if (kPack) {   // the same roundings, written as their codes and each group's scale (the readers' q * s: r exactly)
+         const int g = f.quant == 2 ? 16 : 32;
+-        uint8_t* pr = f.pdst + vi * f.pdst_stride;
++        uint8_t* pr = f.pdst + (long long) f.off * f.off_stride + vi * f.pdst_stride;   // (8CC) g_first (finish_kernel)
+ #pragma unroll
+         for (int j = 0; j < kFinMax; ++j) {
+             if (j >= nj) break;
+@@ -340,8 +340,20 @@ template <bool kPack>
+ __global__ void __launch_bounds__(kThreads) finish_kernel(float* x, int len, long long stride, Finish f) {
+     pdl_wait();
+     pdl_trigger();
++    // (8CC) g_first / ng from the window's position p0, but only for the packed (compressed) finishes that need them;
++    // the dense finishes read the rotary base directly and skip the integer divisions.
++    const bool packed = f.p0_dev != nullptr && f.pdst != nullptr;
++    const int g_first = packed ? (int) (*f.p0_dev / f.pos_step)
++                               : (f.off_dev != nullptr ? *f.off_dev : 0);
++    const int ng = packed ? (int) ((*f.p0_dev + f.T) / f.pos_step - *f.p0_dev / f.pos_step)
++                          : (f.n_dev != nullptr ? *f.n_dev : 0);
++    const bool masked = packed || f.n_dev != nullptr;
++    if (masked && blockIdx.x >= (unsigned) ng) return;
+     const long long v = blockIdx.x;
+-    finish_vec<kPack>(x + v * stride, len, f, f.rd > 0 ? f.pos + (int) (blockIdx.x / f.vpp) * f.pos_step : 0,
++    const int pbase = f.p0_dev != nullptr ? (f.pos_step > 1 ? g_first * f.pos_step : (int) *f.p0_dev)
++                                          : (f.pos_dev != nullptr ? (*f.pos_dev) * f.pos_step : f.pos);
++    f.off = g_first;   // finish_vec's packed destination offset
++    finish_vec<kPack>(x + v * stride, len, f, f.rd > 0 ? pbase + (int) (blockIdx.x / f.vpp) * f.pos_step : 0,
+                       f.dst != nullptr ? f.dst + v * f.dst_stride : nullptr, v);
+ }
+ // (DS4_MULTI_ATTN) vector v is row v / vpp's: that row's position, its dst row (finish_rows)
+@@ -957,18 +969,38 @@ __global__ void copy_regions_kernel(const CopyRegions r) {
+     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x)
+         d[i] = sr[i];
+ }
++// (8CC) replicate's source gather: `bytes` bytes from src + (*g_first) * rb to dst, the source's row offset
++// read from device memory (the plan buffer's g_first) so no host pointer carries the position (capture-ready).
++__global__ void rep_gather_kernel(uint8_t* __restrict__ dst, const uint8_t* __restrict__ src,
++                                  const int* __restrict__ g_first, size_t rb, size_t bytes) {
++    const uint8_t* s = src + (size_t)(*g_first) * rb;
++    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < bytes;
++         i += (size_t) gridDim.x * blockDim.x)
++        dst[i] = s[i];
++}
+ 
+ // ---------------------------------------------------------------- the compressor (ratio > 1), a window in order
+ __global__ void __launch_bounds__(512) compress_kernel(const float* __restrict__ kv, const float* __restrict__ score,
+                                                        float* kv_state, float* score_state, int ratio, int p0, int T,
+                                                        int d, const float* __restrict__ w, float eps,
+-                                                       float* __restrict__ latent) {
++                                                       float* __restrict__ latent,
++                                                       float* __restrict__ log_kv = nullptr,
++                                                       float* __restrict__ log_sc = nullptr, int log_h = 0,
++                                                       const int64_t* __restrict__ p0p = nullptr) {
+     pdl_wait();
+     pdl_trigger();
++    const int p = p0p != nullptr ? (int)(*p0p) : p0;   // (8CC) the window's position from the plan buffer when given
+     int g = 0;
+     for (int t = 0; t < T; ++t) {
+-        const int slot = (p0 + t) % ratio;
+-        const bool pool = (p0 + t + 1) % ratio == 0;
++        const int slot = (p + t) % ratio;
++        const bool pool = (p + t + 1) % ratio == 0;
++        if (log_kv != nullptr) {   // (the undo log, DS4_UNDO_LOG: the overwritten slot's old row, circular over log_h)
++            const size_t lr = (size_t) ((p + t) % log_h) * (size_t) d;
++            for (int e = threadIdx.x; e < d; e += blockDim.x) {
++                log_kv[lr + (size_t) e] = kv_state[(size_t) slot * d + e];
++                log_sc[lr + (size_t) e] = score_state[(size_t) slot * d + e];
++            }
++        }
+         for (int e = threadIdx.x; e < d; e += blockDim.x) {
+             kv_state[(size_t) slot * d + e] = kv[(size_t) t * d + e];
+             score_state[(size_t) slot * d + e] = score[(size_t) t * d + e];
+@@ -1825,7 +1857,7 @@ constexpr int kStage = 16;   // rows a pass stages (a thread: 32 values of one)
+ // values part * 32 .. + 32 of a packed compressed row (kKvFp4, 512 values) as BF16 into dst[0 .. 4) (exact: the
+ // values are E2M1 times an E4M3 scale)
+ __device__ __forceinline__ void unpack32(const uint8_t* rr, int part, uint4* dst) {
+-    const uint4 cw = *(const uint4*) (rr + part * 16);   // 32 codes, two scale groups
++    const uint4 cw = __ldg((const uint4*) (rr + part * 16));   // 32 codes, two scale groups
+     const float k0 = e4m3_value(rr[256 + part * 2]) * 16384.0f, k1 = e4m3_value(rr[256 + part * 2 + 1]) * 16384.0f;
+     const uint32_t wv[4] = {cw.x, cw.y, cw.z, cw.w};
+     uint32_t o[16];
+@@ -1860,7 +1892,8 @@ __global__ void __launch_bounds__(kThreads) unpack_sel_kernel(const uint8_t* __r
+     }
+     if (i >= n_sel) return;
+     const size_t r = (size_t) t * cap + i;
+-    unpack32(ckv + (size_t) sel[(size_t) t * sel_stride + i] * kv_row_bytes(kKvFp4, 512), part, (uint4*) (out + r * 512 + part * 32));
++    const int row = ar.direct ? i : sel[(size_t) t * sel_stride + i];
++    unpack32(ckv + (size_t) row * kv_row_bytes(kKvFp4, 512), part, (uint4*) (out + r * 512 + part * 32));
+ }
+ // (DS4_MULTI_ATTN) the same for rows of several conversations: row t's selection from its own cache c.ckv[t]
+ __global__ void __launch_bounds__(kThreads) unpack_sel_rows_kernel(const AttnCkv c, const int* __restrict__ sel,
+@@ -2446,8 +2479,9 @@ __device__ __forceinline__ void ring_row_to_ext(const uint8_t* __restrict__ ring
+     for (int e = threadIdx.x; e < d; e += blockDim.x)
+         dst[e] = p >= 0 ? f2bf16(e4m3_value(row[e]) * ue8m0_val(row[d + e / 32])) : (uint16_t) 0;
+ }
+-__global__ void ring_to_ext_kernel(const uint8_t* __restrict__ ring, uint16_t* __restrict__ ext, long long p0, int n,
++__global__ void ring_to_ext_kernel(const uint8_t* __restrict__ ring, uint16_t* __restrict__ ext, long long p0_arg, const int64_t* p0p, int n,
+                                    int d) {
++    const long long p0 = p0p != nullptr ? (long long) *p0p : p0_arg;   // (8BX) device-read position when given
+     pdl_wait();
+     pdl_trigger();
+     const int r = blockIdx.x;
+@@ -2466,14 +2500,18 @@ __global__ void ring_to_ext_runs_kernel(const RingRuns rr, uint16_t* __restrict_
+ // rounding's own scale, so each v / 2^k is that E4M3 value times a power of two >= 1, at most 448 - an E4M3 value again.
+ // Row t of a window of T (src: its window buffer row), the ring's row it replaces to backup's row t first
+ __device__ __forceinline__ void ext_row_to_ring(const uint16_t* __restrict__ src, uint8_t* __restrict__ ring,
+-                                                long long p0, int n, int T, int t, int d, uint8_t* __restrict__ backup) {
++                                                long long p0, int n, int T, int t, int d, uint8_t* __restrict__ backup,
++                                                uint8_t* __restrict__ log = nullptr, int log_h = 0) {
+     if (T - t > n) return;   // overwritten by a later row of the window anyway
+     const size_t rb = kv_row_bytes(kKvFp8, d);
+     uint8_t* row = ring + (size_t) ((p0 + t) % n) * rb;
+     if (backup != nullptr) {
+         for (size_t i = threadIdx.x; i < rb; i += blockDim.x) backup[(size_t) t * rb + i] = row[i];
+-        __syncthreads();
+     }
++    if (log != nullptr) {   // (the undo log, DS4_UNDO_LOG: the overwritten row at its own position, circular over log_h)
++        for (size_t i = threadIdx.x; i < rb; i += blockDim.x) log[(size_t) ((p0 + t) % log_h) * rb + i] = row[i];
++    }
++    if (backup != nullptr || log != nullptr) __syncthreads();
+     for (int e0 = 0; e0 < d; e0 += blockDim.x) {   // (d a multiple of 32: a warp's 32 values one group)
+         const int e = e0 + (int) threadIdx.x;
+         const float v = e < d ? bf16f(src[e]) : 0.0f;
+@@ -2486,12 +2524,14 @@ __device__ __forceinline__ void ext_row_to_ring(const uint16_t* __restrict__ src
+     }
+ }
+ __global__ void __launch_bounds__(kThreads) ext_to_ring_kernel(const uint16_t* __restrict__ ext,
+-                                                               uint8_t* __restrict__ ring, long long p0, int n, int T,
+-                                                               int d, uint8_t* __restrict__ backup) {
++                                                               uint8_t* __restrict__ ring, long long p0_arg, const int64_t* p0p, int n, int T,
++                                                               int d, uint8_t* __restrict__ backup,
++                                                               uint8_t* __restrict__ log, int log_h) {
++    const long long p0 = p0p != nullptr ? (long long) *p0p : p0_arg;   // (8BX) device-read position when given
+     pdl_wait();
+     pdl_trigger();
+     const int t = blockIdx.x;
+-    ext_row_to_ring(ext + (size_t) (n + t) * d, ring, p0, n, T, t, d, backup);
++    ext_row_to_ring(ext + (size_t) (n + t) * d, ring, p0, n, T, t, d, backup, log, log_h);
+ }
+ // (DS4_MULTI_ATTN) block (t, k): run k's row t (past its rows: nothing)
+ __global__ void __launch_bounds__(kThreads) ext_to_ring_runs_kernel(const RingRuns rr, const uint16_t* __restrict__ ext,
+@@ -2500,18 +2540,21 @@ __global__ void __launch_bounds__(kThreads) ext_to_ring_runs_kernel(const RingRu
+     pdl_trigger();
+     const int t = blockIdx.x, k = blockIdx.y;
+     if (t >= rr.T[k]) return;
+-    ext_row_to_ring(ext + ((size_t) rr.e0[k] + n + t) * d, rr.ring[k], rr.p0[k], n, rr.T[k], t, d, rr.bak[k]);
++    ext_row_to_ring(ext + ((size_t) rr.e0[k] + n + t) * d, rr.ring[k], rr.p0[k], n, rr.T[k], t, d, rr.bak[k],
++                    rr.log[k], rr.log_h);
+ }
+ 
+-__global__ void ring_restore_kernel(uint8_t* __restrict__ ring, const uint8_t* __restrict__ backup, long long p0, int n,
++__global__ void ring_restore_kernel(uint8_t* __restrict__ ring, const uint8_t* __restrict__ backup, long long p0_arg, const int64_t* p0p, int n,
+                                     int keep, size_t rb) {
++    const long long p0 = p0p != nullptr ? (long long) *p0p : p0_arg;   // (8BX) device-read position when given
+     pdl_wait();
+     pdl_trigger();
+     const int t = keep + blockIdx.x;
+     uint8_t* row = ring + (size_t) ((p0 + t) % n) * rb;
+     for (size_t i = threadIdx.x; i < rb; i += blockDim.x) row[i] = backup[(size_t) t * rb + i];
+ }
+-__global__ void ring_restore_batch_kernel(const RingBatch b, long long p0, int n, int keep, size_t rb) {
++__global__ void ring_restore_batch_kernel(const RingBatch b, long long p0_arg, const int64_t* p0p, int n, int keep, size_t rb) {
++    const long long p0 = p0p != nullptr ? (long long) *p0p : p0_arg;   // (8BX) device-read position when given
+     pdl_wait();
+     pdl_trigger();
+     const int t = keep + blockIdx.x, li = blockIdx.y;
+@@ -2520,7 +2563,8 @@ __global__ void ring_restore_batch_kernel(const RingBatch b, long long p0, int n
+     for (size_t i = threadIdx.x; i < rb; i += blockDim.x) row[i] = src[i];
+ }
+ 
+-__global__ void comp_restore_batch_kernel(const CompBatch b, long long p0, int keep, int d) {
++__global__ void comp_restore_batch_kernel(const CompBatch b, long long p0_arg, const int64_t* p0p, int keep, int d) {
++    const long long p0 = p0p != nullptr ? (long long) *p0p : p0_arg;   // (8BX) device-read position when given
+     pdl_wait();
+     pdl_trigger();
+     const int li = blockIdx.x, R = b.ratio[li];
+@@ -2861,7 +2905,7 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
+                                                             const float* __restrict__ x, int dim, int* idx, float* w,
+                                                             unsigned long long* plan_ptr, Req* req,
+                                                             const float* __restrict__ bias_vl, unsigned vl,
+-                                                            int* cpu_any, float rs_w, int rs_k) {
++                                                            int* cpu_any, float rs_w, int rs_k, float rs_b, float rs_btop) {
+     pdl_wait();
+     pdl_trigger();
+     __shared__ float sc[1024], bs[1024];
+@@ -2876,15 +2920,20 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
+         const float l = logits[i];
+         const float sp = l > 20.0f ? l : log1pf(expf(l));
+         sc[i] = sqrtf(sp);
++        // (Phase 8T) the resident bias, and (8AB) a separate penalty for the first pick: applied a selection round at
++        // a time below, so the router's own top expert can be kept while the lower slots are held to VRAM.
+         bs[i] = sc[i] + bias[i];
+     }
+     __syncthreads();
+     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+     for (int r = 0; r < k; ++r) {
++        const float fr = (r == 0) ? rs_btop : rs_b;
+         float best = -FLT_MAX;
+         int bix = 0x7fffffff;
+-        for (int i = threadIdx.x; i < n; i += blockDim.x)
+-            if (bs[i] > best || (bs[i] == best && i < bix)) best = bs[i], bix = i;
++        for (int i = threadIdx.x; i < n; i += blockDim.x) {
++            const float v = bs[i] - ((fr > 0.0f && vram != nullptr && vram[i] == 0ull) ? fr : 0.0f);
++            if (v > best || (v == best && i < bix)) best = v, bix = i;
++        }
+         for (int o = 16; o > 0; o >>= 1) {
+             const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+             const int oi = __shfl_xor_sync(0xffffffffu, bix, o);
+@@ -2997,10 +3046,13 @@ __global__ void __launch_bounds__(512) route_pair_kernel(const RoutePair a) {
+         __syncthreads();
+         const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+         for (int r = 0; r < k; ++r) {
++            const float fr = (r == 0) ? a.rs_btop : a.rs_b;
+             float best = -FLT_MAX;
+             int bix = 0x7fffffff;
+-            for (int i = threadIdx.x; i < n; i += blockDim.x)
+-                if (bs[i] > best || (bs[i] == best && i < bix)) best = bs[i], bix = i;
++            for (int i = threadIdx.x; i < n; i += blockDim.x) {
++                const float v = bs[i] - ((fr > 0.0f && a.vram != nullptr && a.vram[i] == 0ull) ? fr : 0.0f);
++                if (v > best || (v == best && i < bix)) best = v, bix = i;
++            }
+             for (int o = 16; o > 0; o >>= 1) {
+                 const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+                 const int oi = __shfl_xor_sync(0xffffffffu, bix, o);
+@@ -3313,6 +3365,12 @@ __device__ __forceinline__ float4 sat4(float4 v) {   // (FP16's range: a partial
+     const float m = 65504.0f;
+     return make_float4(fminf(fmaxf(v.x, -m), m), fminf(fmaxf(v.y, -m), m), fminf(fmaxf(v.z, -m), m), fminf(fmaxf(v.w, -m), m));
+ }
++// #define AR_TRACE 1   // (Phase 8AG) instrumentation; absent in production builds
++#ifdef AR_TRACE
++__device__ unsigned long long* g_art = nullptr;   // host-mapped: [dev][cnt, sum_ns, max_ns, last_arrival]
++static __device__ __forceinline__ unsigned long long ar_gt() { unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); return t; }
++#endif
++
+ __global__ void __launch_bounds__(kThreads) ar_rs16_kernel(float* x, int n4, float* rows, float* sums, size_t stride,
+                                                           unsigned* bflags, int nm, int mi, int slot, int slots,
+                                                           unsigned seq) {
+@@ -3330,11 +3388,25 @@ __global__ void __launch_bounds__(kThreads) ar_rs16_kernel(float* x, int n4, flo
+         uint2* mine = row(mi);
+         for (int q = lo + threadIdx.x; q < hi; q += blockDim.x) mine[q] = to_h4(sat4(x4[q]));
+     }
++#ifdef AR_TRACE
++    const unsigned long long t_arr = (threadIdx.x == 0 && blockIdx.x == 0) ? ar_gt() : 0ull;
++#endif
+     __threadfence_system();
+     __syncthreads();
+     if (threadIdx.x == 0) *(volatile unsigned*) rflag(mi) = seq;
+     if ((int) threadIdx.x < nm && (int) threadIdx.x != mi) wait_at_least(rflag(threadIdx.x), seq);
+     __syncthreads();
++#ifdef AR_TRACE
++    if (threadIdx.x == 0 && blockIdx.x == 0 && t_arr && g_art) {
++        const unsigned long long w = ar_gt() - t_arr;
++        g_art[mi * 4 + 0] += 1ull;
++        g_art[mi * 4 + 1] += w;
++        if (w > g_art[mi * 4 + 2]) g_art[mi * 4 + 2] = w;
++        const int sl = (int) (seq % 40u);            // layer proxy: one AR a layer
++        g_art[64 + mi * 80 + sl * 2 + 0] += w;       // sum per layer
++        g_art[64 + mi * 80 + sl * 2 + 1] += 1ull;    // count per layer
++    }
++#endif
+     const int c0 = min(hi, lo + mi * cs), c1 = min(hi, c0 + cs);
+     for (int q = c0 + threadIdx.x; q < c1; q += blockDim.x) {
+         float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+@@ -3788,17 +3860,31 @@ bool pdl_on() {
+ #endif
+ }
+ 
+-// MAYA_DS4_RESIDENT_SKIP_W / MAYA_DS4_RESIDENT_TOPK (MAYA_ names alias them), read once; 0 = off
++// STRATA_DS4_RESIDENT_SKIP_W / STRATA_DS4_RESIDENT_TOPK (MAYA_ names alias them), read once; 0 = off
++// STRATA_DS4_RESIDENT_BIAS=F (Phase 8T): taken off the selection score of every expert that is not in VRAM, so the
++// router prefers a resident expert when the scores are close.  Selection only - the mixture weights keep the unbiased
++// scores (sc), so what is summed is still the router's own weighting.
+ namespace {
+ struct ResidentSkip {
+     float w;
+     int k;
++    float b;
++    float btop;    // (Phase 8AB) the penalty for the FIRST pick only: 0 keeps the router's own top expert
++    // (Phase 8BT) AcceptMoE-flavoured per-block adaptive penalty: a verification block of T rows activates the union
++    // of its rows' experts, so a miss costs more the wider the block.  base 0 (default) = off, bit-identical.
++    float abs;       // STRATA_DS4_RESIDENT_ABS: the base penalty at T=1
++    float abs_block; // STRATA_DS4_RESIDENT_ABS_BLOCK: added per extra verified row (0 = a flat penalty)
+ };
+ ResidentSkip resident_skip() {
+     static const ResidentSkip rs = [] {
+-        ResidentSkip r{0.0f, 0};
+-        if (const char* v = std::getenv("MAYA_DS4_RESIDENT_SKIP_W")) r.w = std::max(0.0f, std::min(0.9f, (float) std::atof(v)));
+-        if (const char* v = std::getenv("MAYA_DS4_RESIDENT_TOPK")) r.k = std::max(0, std::min(kPicks, std::atoi(v)));
++        ResidentSkip r{0.0f, 0, 0.0f, 0.0f, 0.0f, 0.0f};
++        if (const char* v = std::getenv("STRATA_DS4_RESIDENT_SKIP_W")) r.w = std::max(0.0f, std::min(0.9f, (float) std::atof(v)));
++        if (const char* v = std::getenv("STRATA_DS4_RESIDENT_TOPK")) r.k = std::max(0, std::min(kPicks, std::atoi(v)));
++        if (const char* v = std::getenv("STRATA_DS4_RESIDENT_BIAS")) r.b = std::max(0.0f, std::min(1.0e6f, (float) std::atof(v)));
++        r.btop = r.b;   // (the top pick's penalty follows the general one unless it is set on its own)
++        if (const char* v = std::getenv("STRATA_DS4_RESIDENT_BIAS_TOP")) r.btop = std::max(0.0f, std::min(1.0e6f, (float) std::atof(v)));
++        if (const char* v = std::getenv("STRATA_DS4_RESIDENT_ABS")) r.abs = std::max(0.0f, std::min(1.0e6f, (float) std::atof(v)));
++        if (const char* v = std::getenv("STRATA_DS4_RESIDENT_ABS_BLOCK")) r.abs_block = std::max(0.0f, std::min(16.0f, (float) std::atof(v)));
+         return r;
+     }();
+     return rs;
+@@ -3812,8 +3898,14 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T,
+     if (req == nullptr || host_done == nullptr) resp = nullptr;
+     if (resp == nullptr) cpu_any = nullptr;
+     const ResidentSkip rs = resident_skip();
++    // (8BT) the per-block adaptive penalty: base + abs_block per extra verified row (0 base = the plain path)
++    float rb = rs.b, rbt = rs.btop;
++    if (rs.abs > 0.0f) {
++        const float f = rs.abs * (1.0f + rs.abs_block * (float) (T > 1 ? T - 1 : 0));
++        rb = f; rbt = f;
++    }
+     pdl_launch(route_publish_kernel, T, 512, 0, s, logits, bias, n, k, route_scale, vram, x, dim, idx, w, plan_ptr, req,
+-               vl != 0 ? bias_vl : nullptr, vl, cpu_any, rs.w, rs.k);
++               vl != 0 ? bias_vl : nullptr, vl, cpu_any, rs.w, rs.k, rb, rbt);
+     if (req != nullptr) pdl_launch(publish_kernel, 1, 1, 0, s, req, T, seq, na0, na1, resp, cpu_any, host_done);
+ }
+ void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s) {
+@@ -3826,7 +3918,11 @@ bool route_pair(const RoutePair& a, cudaStream_t s) {
+         return false;
+     RoutePair b = a;
+     const ResidentSkip rs = resident_skip();
+-    b.rs_w = rs.w, b.rs_k = rs.k;
++    b.rs_w = rs.w, b.rs_k = rs.k, b.rs_b = rs.b, b.rs_btop = rs.btop;
++    if (rs.abs > 0.0f) {   // (8BT) as route_publish's: a wider verification block biases harder toward resident
++        const float f = rs.abs * (1.0f + rs.abs_block * (float) (a.T > 1 ? a.T - 1 : 0));
++        b.rs_b = f; b.rs_btop = f;
++    }
+     route_pair_kernel<<<dim3(2, (unsigned) b.T), 512, 0, s>>>(b);
+     if (cudaGetLastError() != cudaSuccess) return false;   // (a routing that did not go in is never published)
+     publish_kernel<<<1, 1, 0, s>>>(a.req, a.T, a.seq, a.na0, a.na1, nullptr, nullptr, nullptr);
+@@ -4068,9 +4164,18 @@ bool copy_regions(const CopyRegions& r, cudaStream_t s) {
+     return true;
+ }
+ 
++// (8CC) replicate's source gather (see rep_gather_kernel): nothing launched for 0 bytes.
++void rep_gather(uint8_t* dst, const uint8_t* src, const int* g_first, size_t rb, size_t bytes, cudaStream_t s) {
++    if (bytes == 0) return;
++    const unsigned bx = (unsigned) std::max<size_t>(1, std::min<size_t>(64, (bytes + kThreads - 1) / kThreads));
++    rep_gather_kernel<<<bx, kThreads, 0, s>>>(dst, src, g_first, rb, bytes);
++}
++
+ void compress_win(const float* kv, const float* score, float* kv_state, float* score_state, int ratio, int p0, int T,
+-                  int d, const float* w, float eps, float* latent, cudaStream_t s) {
+-    pdl_launch(compress_kernel, 1, 512, 0, s, kv, score, kv_state, score_state, ratio, p0, T, d, w, eps, latent);
++                  int d, const float* w, float eps, float* latent, cudaStream_t s, float* log_kv, float* log_sc,
++                  int log_h, const int64_t* p0p) {
++    pdl_launch(compress_kernel, 1, 512, 0, s, kv, score, kv_state, score_state, ratio, p0, T, d, w, eps, latent, log_kv,
++               log_sc, log_h, p0p);
+ }
+ 
+ void index_score(const float* q, const float* w, const void* k, int heads, int hd, int T, int n, const int* cand,
+@@ -4591,13 +4696,20 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
+     }
+     // a few queries (a decode step, a short window): their selected rows decoded once a query into the scratch, then
+     // the BF16 rows' kernel itself (heads_per_block -1: this way at any T)
++    // Experimental Phase 7P: bypass the unpack scratch launch for one-token
++    // FP4 decode when the original packed rows are directly available.
++    if (T == 1 && ckv_fmt == kKvFp4 && std::getenv("DS4_PACKED_ATTN") != nullptr && heads % 8 == 0) {
++        pdl_launch(sparse_attn_packed_kernel<8>, dim3(heads / 8, T), kThreads, 0, s, q, win,
++                   (const uint8_t*) ckv, sel, sel_stride, a, sink, heads, scale, out);
++        return;
++    }
+     const bool few = heads_per_block == -1 || (heads_per_block == 0 && T <= kAttnScratchT);   // (0: attn_few)
+     if (few && attn_scr_fits(T, sel_stride, scr)) {
+         pdl_launch(unpack_sel_kernel, dim3(cdiv(sel_stride, kStage), T), kThreads, 0, s, (const uint8_t*) ckv, sel, sel_stride, a,
+                    scr->cap, scr->rows);
+ #if !defined(STRATA_USE_HIP)
+-        if (T == 1)   // (V100: the loads ahead pay for the decode's kernel at one query, not at more)
+-            pdl_launch(sparse_attn_kernel<true, 8>, dim3(heads, T), kThreads, 0, s, q, win, scr->rows, nullptr, scr->cap, a, sink,
++        if (T == 1)   // (V100: preload four rows to reduce register pressure while retaining row reuse)
++            pdl_launch(sparse_attn_kernel<true, 4>, dim3(heads, T), kThreads, 0, s, q, win, scr->rows, nullptr, scr->cap, a, sink,
+                        heads, d, scale, out);
+         else
+ #endif
+@@ -4651,8 +4763,8 @@ bool sparse_attn_rows(const float* q, const uint16_t* win, const AttnCkv& c, con
+     return true;
+ }
+ 
+-void ring_to_ext(const uint8_t* ring, uint16_t* ext, int64_t p0, int n, int d, cudaStream_t s) {
+-    pdl_launch(ring_to_ext_kernel, n, kThreads, 0, s, ring, ext, (long long) p0, n, d);
++void ring_to_ext(const uint8_t* ring, uint16_t* ext, int64_t p0, int n, int d, cudaStream_t s, const int64_t* p0p) {
++    pdl_launch(ring_to_ext_kernel, n, kThreads, 0, s, ring, ext, (long long) p0, p0p, n, d);
+ }
+ void ring_to_ext_runs(const RingRuns& r, uint16_t* ext, int n, int d, cudaStream_t s) {
+     if (r.runs > 0) pdl_launch(ring_to_ext_runs_kernel, dim3(n, r.runs), kThreads, 0, s, r, ext, n, d);
+@@ -4666,24 +4778,104 @@ void ext_to_ring_runs(const RingRuns& r, const uint16_t* ext, int n, int d, cuda
+     for (int k = 0; k < r.runs; ++k) tmax = std::max(tmax, r.T[k]);
+     if (tmax > 0) pdl_launch(ext_to_ring_runs_kernel, dim3(tmax, r.runs), kThreads, 0, s, r, ext, n, d);
+ }
+-void ext_to_ring(const uint16_t* ext, uint8_t* ring, int64_t p0, int n, int T, int d, cudaStream_t s, uint8_t* backup) {
++void ext_to_ring(const uint16_t* ext, uint8_t* ring, int64_t p0, int n, int T, int d, cudaStream_t s, uint8_t* backup,
++                 uint8_t* log, int log_h, const int64_t* p0p) {
+     if (d % 32 != 0) {
+         std::fprintf(stderr, "ds4 ext_to_ring: row of %d not covered\n", d);
+         return;
+     }
+-    pdl_launch(ext_to_ring_kernel, T, kThreads, 0, s, ext, ring, (long long) p0, n, T, d, backup);
++    pdl_launch(ext_to_ring_kernel, T, kThreads, 0, s, ext, ring, (long long) p0, p0p, n, T, d, backup, log, log_h);
+ }
+-void ring_restore(uint8_t* ring, const uint8_t* backup, int64_t p0, int n, int keep, int T, int d, cudaStream_t s) {
++void ring_restore(uint8_t* ring, const uint8_t* backup, int64_t p0, int n, int keep, int T, int d, cudaStream_t s, const int64_t* p0p) {
+     if (T > keep)
+-        pdl_launch(ring_restore_kernel, T - keep, kThreads, 0, s, ring, backup, (long long) p0, n, keep, kv_row_bytes(kKvFp8, d));
++        pdl_launch(ring_restore_kernel, T - keep, kThreads, 0, s, ring, backup, (long long) p0, p0p, n, keep, kv_row_bytes(kKvFp8, d));
+ }
+-void ring_restore_batch(const RingBatch& b, int64_t p0, int n, int keep, int T, int d, cudaStream_t s) {
++void ring_restore_batch(const RingBatch& b, int64_t p0, int n, int keep, int T, int d, cudaStream_t s, const int64_t* p0p) {
+     if (T > keep && b.n > 0)
+-        pdl_launch(ring_restore_batch_kernel, dim3(T - keep, b.n), kThreads, 0, s, b, (long long) p0, n, keep,
++        pdl_launch(ring_restore_batch_kernel, dim3(T - keep, b.n), kThreads, 0, s, b, (long long) p0, p0p, n, keep,
+                    kv_row_bytes(kKvFp8, d));
+ }
+-void comp_restore_batch(const CompBatch& b, int64_t p0, int keep, int d, cudaStream_t s) {
+-    if (b.n > 0) pdl_launch(comp_restore_batch_kernel, b.n, kThreads, 0, s, b, (long long) p0, keep, d);
++void comp_restore_batch(const CompBatch& b, int64_t p0, int keep, int d, cudaStream_t s, const int64_t* p0p) {
++    if (b.n > 0) pdl_launch(comp_restore_batch_kernel, b.n, kThreads, 0, s, b, (long long) p0, p0p, keep, d);
++}
++// restore()'s undo-log rewind (DS4_UNDO_LOG).  Undoing positions limit .. pos-1 in reverse leaves each slot holding the
++// earliest undone write's overwritten row - equivalently: slot s of the ring is log[p_min % log_h], where p_min is the
++// smallest position in [limit, pos-1] with p_min % win == s (none: the slot is not written in the range, left as it is).
++// One block a slot (x) per layer (y), so no two blocks write the same slot - correct even when pos - limit > win.
++__global__ void ring_undo_batch_kernel(const UndoBatch b, long long limit, long long pos, int win, int log_h, size_t rb) {
++    pdl_wait();
++    pdl_trigger();
++    const int s = blockIdx.x, li = blockIdx.y;
++    const long long lo = limit, hi = pos - 1;
++    const long long pmin = lo + (((long long) s - lo) % win + win) % win;
++    if (pmin > hi) return;
++    uint8_t* row = b.ring[li] + (size_t) s * rb;
++    const uint8_t* src = b.log[li] + (size_t) (pmin % log_h) * rb;
++    for (size_t i = threadIdx.x; i < rb; i += blockDim.x) row[i] = src[i];
++}
++// The same for the compressors' partial groups: slot s of layer li is log[(p_min % log_h) * d], p_min the smallest
++// position in [limit, pos-1] with p_min % ratio == s.
++__global__ void comp_undo_batch_kernel(const CompUndoBatch b, long long limit, long long pos, int log_h, int d) {
++    pdl_wait();
++    pdl_trigger();
++    const int s = blockIdx.x, li = blockIdx.y;
++    const int R = b.ratio[li];
++    if (s >= R) return;
++    const long long lo = limit, hi = pos - 1;
++    const long long pmin = lo + (((long long) s - lo) % R + R) % R;
++    if (pmin > hi) return;
++    const size_t lr = (size_t) (pmin % log_h) * (size_t) d;
++    float* kv_row = b.kv_state[li] + (size_t) s * d;
++    float* sc_row = b.score_state[li] + (size_t) s * d;
++    for (int e = threadIdx.x; e < d; e += blockDim.x) {
++        kv_row[e] = b.log_kv[li][lr + e];
++        sc_row[e] = b.log_sc[li][lr + e];
++    }
++}
++void ring_undo_batch(const UndoBatch& b, int64_t limit, int64_t pos, int win, int log_h, int d, cudaStream_t s) {
++    if (pos > limit && b.n > 0)
++        pdl_launch(ring_undo_batch_kernel, dim3((unsigned) win, (unsigned) b.n), kThreads, 0, s, b, (long long) limit,
++                   (long long) pos, win, log_h, kv_row_bytes(kKvFp8, d));
++}
++void comp_undo_batch(const CompUndoBatch& b, int64_t limit, int64_t pos, int log_h, int d, cudaStream_t s) {
++    if (pos <= limit || b.n <= 0) return;
++    int maxr = 1;
++    for (int i = 0; i < b.n; ++i) maxr = std::max(maxr, b.ratio[i]);
++    pdl_launch(comp_undo_batch_kernel, dim3((unsigned) maxr, (unsigned) b.n), kThreads, 0, s, b, (long long) limit,
++               (long long) pos, log_h, d);
++}
++// a verify window's accepted rows (i < keep) into the undo log: the ring from ring_bak[i], the compressor from
++// snap[slot] (i < ratio) or the window's raw row kv_rows[i - ratio].  One block a row (x) per layer (y).
++__global__ void undo_commit_batch_kernel(const UndoCommitBatch b, long long p0_arg, const int64_t* p0p, int keep, int log_h, int d) {
++    const long long p0 = p0p != nullptr ? (long long) *p0p : p0_arg;   // (8BX) device-read position when given
++    pdl_wait();
++    pdl_trigger();
++    const int i = blockIdx.x, li = blockIdx.y;
++    if (i >= keep) return;
++    const long long p = p0 + i;
++    if (b.undo_ring[li] != nullptr) {
++        const size_t rb = kv_row_bytes(kKvFp8, d);
++        uint8_t* dst = b.undo_ring[li] + (size_t) (p % log_h) * rb;
++        const uint8_t* src = b.ring_bak[li] + (size_t) i * rb;
++        for (size_t x = threadIdx.x; x < rb; x += blockDim.x) dst[x] = src[x];
++    }
++    if (b.undo_kv[li] != nullptr) {
++        const int R = b.ratio[li];
++        const int slot = (int) (p % R);
++        const size_t lr = (size_t) (p % log_h) * (size_t) d;
++        const float* kvsrc = (i < R) ? b.snap[li] + (size_t) slot * d : b.kv_rows[li] + (size_t) (i - R) * d;
++        const float* scsrc =
++            (i < R) ? b.snap[li] + (size_t) R * d + (size_t) slot * d : b.sc_rows[li] + (size_t) (i - R) * d;
++        for (int e = threadIdx.x; e < d; e += blockDim.x) {
++            b.undo_kv[li][lr + e] = kvsrc[e];
++            b.undo_sc[li][lr + e] = scsrc[e];
++        }
++    }
++}
++void undo_commit_batch(const UndoCommitBatch& b, int64_t p0, int keep, int log_h, int d, cudaStream_t s, const int64_t* p0p) {
++    if (keep <= 0 || b.n <= 0) return;
++    pdl_launch(undo_commit_batch_kernel, dim3((unsigned) keep, (unsigned) b.n), kThreads, 0, s, b, (long long) p0, p0p, keep,
++               log_h, d);
+ }
+ void hc_mean(const float* h, int T, int hc, int dim, float* out, long long out_stride, cudaStream_t s) {
+     pdl_launch(hc_mean_kernel, dim3(cdiv(dim, kThreads), T), kThreads, 0, s, h, hc, dim, out, out_stride);
+@@ -4784,7 +4976,58 @@ void set_flag(unsigned* flag, unsigned v, cudaStream_t s) {
+ void tab_set(const unsigned long long* pairs, int n, cudaStream_t s) {
+     if (n > 0) pdl_launch(tab_set_kernel, cdiv(n, 128), 128, 0, s, pairs, n);
+ }
++#ifdef AR_TRACE
++static unsigned long long* ar_trace_mem() {
++    static unsigned long long* p = nullptr;
++    if (p == nullptr) {
++        void* hp = nullptr;
++        cudaHostAlloc(&hp, sizeof(unsigned long long) * 512, cudaHostAllocMapped);
++        std::memset(hp, 0, sizeof(unsigned long long) * 512);
++        p = (unsigned long long*) hp;
++    }
++    return p;
++}
++static void ar_trace_bind(int dev) {   // each device gets its own copy of the symbol
++    static bool done[64] = {false};
++    if (dev < 0 || dev >= 64) return;
++    if (!done[dev]) {
++        done[dev] = true;
++        unsigned long long* hp = ar_trace_mem();
++        unsigned long long* dp = nullptr;
++        cudaHostGetDevicePointer((void**) &dp, hp, 0);
++        int cur = 0; cudaGetDevice(&cur);
++        cudaSetDevice(dev);
++        cudaMemcpyToSymbol(g_art, &dp, sizeof(dp));
++        cudaSetDevice(cur);
++    }
++}
++static void ar_trace_dump(const char* where) {
++    unsigned long long* p = ar_trace_mem();
++    std::fprintf(stderr, "artrace%s:", where);
++    for (int d = 0; d < 4; ++d)
++        if (p[d * 4 + 0])
++            std::fprintf(stderr, " dev%d n=%llu mean=%lluus max=%lluus", d, p[d * 4 + 0],
++                         (p[d * 4 + 1] / p[d * 4 + 0]) / 1000ull, p[d * 4 + 2] / 1000ull);
++    std::fprintf(stderr, "\n");
++    std::fprintf(stderr, "arperlayer:");
++    for (int d = 0; d < 4; ++d) {
++        if (!p[d * 4 + 0]) continue;
++        std::fprintf(stderr, "\n  dev%d:", d);
++        for (int sl = 0; sl < 40; ++sl) {
++            const unsigned long long c = p[64 + d * 80 + sl * 2 + 1];
++            if (c) std::fprintf(stderr, " %llu", (p[64 + d * 80 + sl * 2 + 0] / c) / 1000ull);
++        }
++    }
++    std::fprintf(stderr, "\n");
++}
++#endif
++
+ void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s) {
++#ifdef AR_TRACE
++    { int cur = -1; cudaGetDevice(&cur); ar_trace_bind(cur);
++      static int tick = 0;
++      if (++tick % 128 == 0) ar_trace_dump(""); }
++#endif
+     const int slot = (int) (seq % (unsigned) a.slots);
+     if (a.nm == 2 && a.ar2 > 0 && a.pflags != nullptr) {   // (DS4_AR2: the put and the sums in one pipelined launch)
+         const int n4 = n / 4;
+@@ -4801,7 +5044,16 @@ void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned
+             return e == nullptr || std::atoi(e) != 0;   // (on unless DS4_AR_F16=0)
+         }();
+         const int n4 = n / 4;
+-        const int blocks = std::max(1, std::min(kArBlocks, cdiv(n4, kThreads)));
++        // (Phase 8BA) STRATA_DS4_AR_BLOCKS: the reduce-scatter's block count. 64 is the default and is far more
++        // than a latency-bound collective of a few KB needs; each block spins on the members' flags and re-reads
++        // their rows, so the tail blocks mostly add contention and SM occupancy. Clamped to kArBlocks because
++        // the flag array's stride is laid out for that many (a smaller grid simply uses a prefix of it).
++        static const int ar_blocks = [] {
++            const char* v = std::getenv("STRATA_DS4_AR_BLOCKS");
++            const int n = v != nullptr ? std::atoi(v) : 0;
++            return (n > 0) ? std::min(n, kArBlocks) : kArBlocks;
++        }();
++        const int blocks = std::max(1, std::min(ar_blocks, cdiv(n4, kThreads)));
+         if (f16)
+             pdl_launch(ar_rs16_kernel, blocks, kThreads, 0, s, x, n4, a.data, a.sums, a.stride, a.bflags, a.nm, mi, slot, a.slots, seq);
+         else
+diff --git a/src/ds4/ds4_kernels.cuh b/src/ds4/ds4_kernels.cuh
+index b53c96c..9d15d9e 100644
+--- a/src/ds4/ds4_kernels.cuh
++++ b/src/ds4/ds4_kernels.cuh
+@@ -49,6 +49,18 @@ void embed(const uint16_t* rows_bf16, int T, float* h, int dim, int hc, cudaStre
+ /// dst is given, or packed (quant > 0: the cache format of that number, kv_row_bytes) to pdst + v * pdst_stride bytes
+ /// when pdst is given (x then left as it was).
+ struct Finish {
++    const int* n_dev = nullptr;   // (8BQ) vectors >= *n_dev are skipped: the launch is shape-stable
++    // (8BX) the same idea for the two other position-derived values: the destination's row offset (g_first) and
++    // the rotary position base. With these set, no part of a launch depends on where in the context we are.
++    const int* off_dev = nullptr;  // destination row index (g_first), read on the device
++    long long off_stride = 0;      // bytes a destination row
++    const int* pos_dev = nullptr;  // rotary base index (g_first): position = *pos_dev * pos_step
++    // (8CC) the window's position p0 from the plan buffer: g_first = *p0_dev / pos_step, ng = (*p0_dev + T) /
++    // pos_step - *p0_dev / pos_step, rotary base = g_first * pos_step (pos_step > 1) or *p0_dev (pos_step 1). Set on
++    // the decode path so no per-layer ng/g_first publish is needed.
++    const int64_t* p0_dev = nullptr;
++    int T = 1;
++    int off = 0;                   // g_first, computed in finish_kernel (finish_vec's packed destination offset)
+     const float* w = nullptr;
+     float eps = 1e-20f;
+     int rd = 0, pos = 0, inverse = 0, vpp = 1, pos_step = 1;
+@@ -174,12 +186,16 @@ struct CopyRegions {
+     int n = 0;
+ };
+ bool copy_regions(const CopyRegions& r, cudaStream_t s);
++/// (8CC) replicate's source gather: `bytes` bytes from `src + (*g_first) * rb` to `dst`, the source's row offset
++/// read from device memory (the plan buffer's g_first) so no host pointer carries the position (capture-ready).
++void rep_gather(uint8_t* dst, const uint8_t* src, const int* g_first, size_t rb, size_t bytes, cudaStream_t s);
+ 
+ /// The ratio-r compressor over a window: token t (position p0 + t) takes slot (p0 + t) % r of the state; each token that
+ /// completes a group writes the group's pooled latent (softmax over the slots, per value, then rmsnorm(w)) to the next
+ /// row of latent.
+ void compress_win(const float* kv, const float* score, float* kv_state, float* score_state, int ratio, int p0, int T,
+-                  int d, const float* w, float eps, float* latent, cudaStream_t s);
++                  int d, const float* w, float eps, float* latent, cudaStream_t s, float* log_kv = nullptr,
++                  float* log_sc = nullptr, int log_h = 0, const int64_t* p0p = nullptr);
+ 
+ /// Per-query sizes, by value - or (gen > 0, a chunk of any length) made on the device from the query's position: query
+ /// t at position p0 + t has nn = (p0 + t + 1) / R compressed positions and cb = min(ccap, ceil(nn / blk)) candidate
+@@ -248,6 +264,7 @@ struct AttnRows {
+     // position lo or later (0: the whole window - a truncated prompt's consumer layers see only its tail)
+     int gen = 0, t0 = 0, win = 0, R = 0, kcap = 0;
+     long long p0 = 0, lo = 0;
++    int direct = 0; // eligible all-position decode: unpack compressed rows by positional index
+ };
+ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
+                  const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
+@@ -270,9 +287,10 @@ bool sparse_attn_rows(const float* q, const uint16_t* win, const AttnCkv& c, con
+ /// ring[(p0 + t) % n] = ext[n + t] for t < T.  The ring's rows kKvFp8 (each group of 32 at the smallest power-of-two
+ /// scale its BF16 values fit under: exact for values on the FP8 grid, the window's), the window buffer's BF16 (p0 = n:
+ /// the ring's rows as they lie).
+-void ring_to_ext(const uint8_t* ring, uint16_t* ext, int64_t p0, int n, int d, cudaStream_t s);
++void ring_to_ext(const uint8_t* ring, uint16_t* ext, int64_t p0, int n, int d, cudaStream_t s,
++                  const int64_t* p0p = nullptr);   // (8BX) null: the argument, as before
+ void ext_to_ring(const uint16_t* ext, uint8_t* ring, int64_t p0, int n, int T, int d, cudaStream_t s,
+-                 uint8_t* backup = nullptr);
++                 uint8_t* backup = nullptr, uint8_t* log = nullptr, int log_h = 0, const int64_t* p0p = nullptr);
+ 
+ /// (DS4_MULTI_ATTN, --parallel) a multi step's runs at once - run k one conversation's T[k] rows from position p0[k],
+ /// its ring ring[k], its window buffer the rows e0[k] .. e0[k] + n + T[k] - 1 of one shared buffer (ds4_multi_attn.hpp):
+@@ -281,6 +299,8 @@ void ext_to_ring(const uint16_t* ext, uint8_t* ring, int64_t p0, int n, int T, i
+ struct RingRuns {
+     uint8_t* ring[kWin] = {};
+     uint8_t* bak[kWin] = {};
++    uint8_t* log[kWin] = {};   // (the undo log's ring rows, or null; log_h: its horizon in tokens)
++    int log_h = 0;
+     long long p0[kWin] = {};
+     int e0[kWin] = {}, T[kWin] = {};
+     int runs = 0;
+@@ -302,7 +322,7 @@ struct IotaRows {
+ };
+ void iota_rows_at(int* out, int T, const IotaRows& r, int stride, cudaStream_t s);
+ /// A speculative window's rollback: ring[(p0 + t) % n] = backup[t] for keep <= t < T (the rows ext_to_ring replaced).
+-void ring_restore(uint8_t* ring, const uint8_t* backup, int64_t p0, int n, int keep, int T, int d, cudaStream_t s);
++void ring_restore(uint8_t* ring, const uint8_t* backup, int64_t p0, int n, int keep, int T, int d, cudaStream_t s, const int64_t* p0p = nullptr);
+ /// The same for up to kMaxRingBatch layers' rings at once (one launch).
+ constexpr int kMaxRingBatch = 64;
+ struct RingBatch {
+@@ -310,7 +330,7 @@ struct RingBatch {
+     const uint8_t* bak[kMaxRingBatch] = {};
+     int n = 0;
+ };
+-void ring_restore_batch(const RingBatch& b, int64_t p0, int n, int keep, int T, int d, cudaStream_t s);
++void ring_restore_batch(const RingBatch& b, int64_t p0, int n, int keep, int T, int d, cudaStream_t s, const int64_t* p0p = nullptr);
+ /// The compressors' state back to a window's first `keep` positions, up to kMaxRingBatch layers at once: each layer's
+ /// snapshot (ratio x d kv, then ratio x d scores: the state before the window), then the kept rows (kv[t], score[t],
+ /// t < keep) at their slots (p0 + t) % ratio - compress_win's state over the snapshot, its pools' latent rows left out.
+@@ -323,7 +343,42 @@ struct CompBatch {
+     int ratio[kMaxRingBatch] = {};
+     int n = 0;
+ };
+-void comp_restore_batch(const CompBatch& b, int64_t p0, int keep, int d, cudaStream_t s);
++void comp_restore_batch(const CompBatch& b, int64_t p0, int keep, int d, cudaStream_t s, const int64_t* p0p = nullptr);
++/// A restore()'s undo-log rewind (DS4_UNDO_LOG): each layer's ring rows back to `limit` from its undo log (circular
++/// over log_h) - slot s from log[p_min % log_h], p_min the smallest position in [limit, pos-1] with p_min % win == s -
++/// up to kMaxRingBatch layers at once.
++struct UndoBatch {
++    uint8_t* ring[kMaxRingBatch] = {};
++    const uint8_t* log[kMaxRingBatch] = {};
++    int n = 0;
++};
++void ring_undo_batch(const UndoBatch& b, int64_t limit, int64_t pos, int win, int log_h, int d, cudaStream_t s);
++/// The same for the compressors' partial groups: each layer's slot (p % ratio) restored from its undo log's row
++/// (p % log_h) - p the smallest position in [limit, pos-1] with p % ratio == slot - up to kMaxRingBatch layers at once.
++struct CompUndoBatch {
++    float* kv_state[kMaxRingBatch] = {};
++    float* score_state[kMaxRingBatch] = {};
++    const float* log_kv[kMaxRingBatch] = {};
++    const float* log_sc[kMaxRingBatch] = {};
++    int ratio[kMaxRingBatch] = {};
++    int n = 0;
++};
++void comp_undo_batch(const CompUndoBatch& b, int64_t limit, int64_t pos, int log_h, int d, cudaStream_t s);
++/// A verify window's ACCEPTED rows into the undo log (DS4_UNDO_LOG): the rows it wrote during forward() were spec_win
++/// and not logged, so rollback() writes their overwritten values here - the ring from ring_bak[i], the compressor from
++/// snap[slot] (i < ratio) or the window's own raw row kv_rows[i - ratio].  Accepted rows i < keep only.
++struct UndoCommitBatch {
++    uint8_t* undo_ring[kMaxRingBatch] = {};
++    const uint8_t* ring_bak[kMaxRingBatch] = {};
++    float* undo_kv[kMaxRingBatch] = {};
++    float* undo_sc[kMaxRingBatch] = {};
++    const float* snap[kMaxRingBatch] = {};       // 2*ratio*hd: the pre-window partial (kv, then score)
++    const float* kv_rows[kMaxRingBatch] = {};    // the window's raw kv rows (t = 0..T-1)
++    const float* sc_rows[kMaxRingBatch] = {};    // its raw score rows
++    int ratio[kMaxRingBatch] = {};
++    int n = 0;
++};
++void undo_commit_batch(const UndoCommitBatch& b, int64_t p0, int keep, int log_h, int d, cudaStream_t s, const int64_t* p0p = nullptr);
+ 
+ /// Engram.  rows: n FP8 E4M3 rows of hd values, scales n x (hd / 32) E8M0 -> out F32 [n * hd].  fmt 1 / 2 / 3: the rows are
+ /// ggml Q6_K superblocks (210 bytes a 256 values), IQ4_NL blocks (18 a 32) or Q5_K superblocks (176 a 256) instead,
+@@ -416,6 +471,8 @@ struct RoutePair {
+     int T = 1;   // (=2: a window's rows, 1 .. kWin)
+     float rs_w = 0.0f;   // (route_pair sets these from MAYA_DS4_RESIDENT_SKIP_W / _TOPK)
+     int rs_k = 0;
++    float rs_b = 0.0f;   // (Phase 8T) STRATA_DS4_RESIDENT_BIAS: selection penalty for an expert not in VRAM
++    float rs_btop = 0.0f;   // (Phase 8AB) STRATA_DS4_RESIDENT_BIAS_TOP: the same, for the first pick only
+ };
+ bool route_pair(const RoutePair& a, cudaStream_t s);
+ /// Waits (one thread, on the device) until *seq_ptr == seq.
+diff --git a/src/ds4/ds4_main.cpp b/src/ds4/ds4_main.cpp
+index 596edbd..3d83b27 100644
+--- a/src/ds4/ds4_main.cpp
++++ b/src/ds4/ds4_main.cpp
+@@ -36,6 +36,33 @@
+ #include "strata/spec/suffix_drafter.hpp"
+ 
+ #include <cuda_profiler_api.h>
++#if __has_include(<nvtx3/nvToolsExt.h>)
++#include <nvtx3/nvToolsExt.h>
++#define MAYA_HAVE_NVTX 1
++#else
++#define MAYA_HAVE_NVTX 0
++#endif
++
++namespace {
++struct MayaDecodeTrace {
++    bool on = std::getenv("DS4_TRACE_DECODE") != nullptr;
++    int warm = std::max(0, std::getenv("DS4_TRACE_WARMUP") ? std::atoi(std::getenv("DS4_TRACE_WARMUP")) : 8);
++    int steps = std::max(1, std::getenv("DS4_TRACE_STEPS") ? std::atoi(std::getenv("DS4_TRACE_STEPS")) : 64);
++    int count = 0;
++    bool active = false;
++    bool begin() {
++        if (!on || active || count < warm) return false;
++        active = true;
++        cudaProfilerStart();
++        return true;
++    }
++    void end() {
++        if (!active) return;
++        ++count;
++        if (count - warm >= steps) { cudaProfilerStop(); active = false; }
++    }
++};
++}
+ 
+ // the commit and the release this binary was built from (--version, the --verbose "ds4: build" line):
+ // cmake/build_id.cmake writes them at every build
+@@ -1155,6 +1182,24 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
+         note(msg);
+         return len;
+     };
++    // DS4_UNDO_FIRST: the largest prefix a kept conversation *could* restore this prompt to, without loading it - the
++    // probe the in-place rewind compares the bound conversation's undo-log limit against (slot_take's loop, no load)
++    const auto slot_probe = [&](const std::vector<int>& prompt, const std::vector<Pic>& want) -> size_t {
++        size_t best = 0;
++        if (slot_max <= 0 || prompt.size() < 2) return 0;
++        for (size_t i = 0; i < slots.size(); ++i) {
++            const auto& t = slots[i].tokens;
++            const size_t lim = std::min(t.size(), prompt.size() - 1);
++            size_t c = 0;
++            while (c < lim && t[c] == prompt[c]) ++c;
++            size_t u = c == t.size() ? c : 0;
++            if (u == 0)
++                for (int64_t k : slots[i].cks)
++                    if ((size_t) k <= c && (size_t) k > u) u = (size_t) k;
++            if (u > best && pics_match(slots[i].pics, want, u)) best = u;
++        }
++        return best;
++    };
+     // SHARED STARTS (#607): the state at the end of a system prompt and its tools (the shared= restore point of a
+     // prompt read from token 0) is also kept apart from its conversation, in RAM, so a NEW conversation behind the same
+     // start - after an unrelated one, in another --parallel conversation, with or without MAYA_DS4_SLOT_KEEP - takes it
+@@ -1422,6 +1467,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
+             std::snprintf(b, sizeof b, " skip_on=%d", s.skip_on);
+             out += b;
+         }
++        if (s.undo_hits > 0 || s.undo_misses > 0) {   // DS4_UNDO_LOG: this run's rewind log (cumulative since start)
++            std::snprintf(b, sizeof b, " undo_hits=%lld undo_reused=%lld undo_rewound=%lld undo_misses=%lld",
++                          (long long) s.undo_hits, (long long) s.undo_reused, (long long) s.undo_rewound,
++                          (long long) s.undo_misses);
++            out += b;
++        }
+         return out;
+     };
+     // a request's prompt into the bound conversation (one conversation's requests and --parallel's alike), in three
+@@ -1501,18 +1552,32 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
+             // CONVERSATION SLOTS: this prompt does not continue the conversation in the model - that one is set aside
+             // first (another one takes the model, and its state is lost otherwise), then the kept conversation this
+             // prompt does continue is taken back - if it goes further back than the checkpoints the state itself holds
+-            if (slot_max > 0) slot_put("");
+-            beat();
+             const int64_t limit = (int64_t) std::min(c, r.ids.size() - 1);
+             const int64_t rs = m.restorable(limit);
+-            bool whole = false;
+-            // (a kept shared start, when it covers more than the state itself can go back to; a kept conversation
+-            //  only when it covers more than either)
+-            const int pi = abl ? -1 : prefix_find(r.ids, pics, rs > 0 ? (size_t) rs : 0);
+-            const size_t plen = pi >= 0 ? prefixes[(size_t) pi].tokens.size() : 0;
+-            const size_t back = abl ? 0 : slot_take(r.ids, pics, std::max(rs > 0 ? (size_t) rs : 0, plen), whole);
++            // DS4_UNDO_FIRST (prototype): when the undo log covers the bound conversation's exact prefix and no kept
++            // conversation matches more, rewind it in place - skipping the full-state slot_put copy and the
++            // slot/prefix round trip (the state is not parked: an edit discards the tail it would have kept).
++            static const bool undo_first = std::getenv("DS4_UNDO_FIRST") != nullptr &&
++                                           std::atoi(std::getenv("DS4_UNDO_FIRST")) != 0;
++            const bool in_place = undo_first && limit > 0 && rs == limit &&
++                                  (size_t) limit >= slot_probe(r.ids, pics);
++            if (!in_place && slot_max > 0) slot_put("");
+             beat();
+-            if (back > 0) {
++            bool whole = false;
++            int pi = -1;
++            size_t plen = 0, back = 0;
++            if (!in_place) {
++                // (a kept shared start, when it covers more than the state itself can go back to; a kept conversation
++                //  only when it covers more than either)
++                pi = abl ? -1 : prefix_find(r.ids, pics, rs > 0 ? (size_t) rs : 0);
++                plen = pi >= 0 ? prefixes[(size_t) pi].tokens.size() : 0;
++                back = abl ? 0 : slot_take(r.ids, pics, std::max(rs > 0 ? (size_t) rs : 0, plen), whole);
++                beat();
++            }
++            if (in_place) {
++                if (m.restore(limit)) from = (size_t) m.pos();
++                else { m.reset(); from = 0; }
++            } else if (back > 0) {
+                 from = back;
+                 continued = whole;
+             } else if (pi >= 0 && prefix_take(pi)) {
+@@ -2062,6 +2127,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
+         double busy_t1 = 0;
+         long long busy_n = 0, busy_io = -1;
+         strata::ds4::Stats busy_s;
++        MayaDecodeTrace decode_trace;
+         std::string err;
+         std::fprintf(stderr, "maya ds4 serve: %d conversations at once (--parallel): GEN needs rid=<id>; STOP <rid>\n",
+                      nseq);
+@@ -2469,6 +2535,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
+                         sv.push_back(a->seq);
+                         tv.push_back(a->tok);
+                     }
++                    const bool trace_step = decode_trace.begin();
++#if MAYA_HAVE_NVTX
++                    if (trace_step) nvtxRangePushA("MAYA_TOKEN_STEP");
++#endif
+                     if (!m.step_multi(sv.data(), tv.data(), nn, err)) cancel_all();
+                     else {
+                         for (int i = 0; i < nn; ++i) {
+@@ -2483,6 +2553,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
+                         }
+                         stepped = true;
+                     }
++                    if (trace_step) { 
++#if MAYA_HAVE_NVTX
++                        nvtxRangePop();
++#endif
++                        decode_trace.end();
++                    } else if (decode_trace.on && !decode_trace.active) ++decode_trace.count;
+                 } else {
+                     std::vector<std::vector<int>> rows((size_t) nn);
+                     std::vector<const int*> tp((size_t) nn);
+@@ -2494,6 +2570,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
+                         lens[(size_t) i] = (int) rows[(size_t) i].size();
+                         sv[(size_t) i] = need[(size_t) i]->seq;
+                     }
++                    const bool trace_step = decode_trace.begin();
++#if MAYA_HAVE_NVTX
++                    if (trace_step) nvtxRangePushA("MAYA_TOKEN_STEP");
++#endif
+                     if (!m.step_multi_spec(sv.data(), tp.data(), lens.data(), nn, err)) cancel_all();
+                     else
+                         for (int i = 0; i < nn; ++i) {
+@@ -2520,6 +2600,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
+                             if (a.r.logprobs >= 0) a.got_lp = lp_take(m, a.got.size());
+                             next_tok(a);
+                         }
++                    if (trace_step) {
++#if MAYA_HAVE_NVTX
++                        nvtxRangePop();
++#endif
++                        decode_trace.end();
++                    } else if (decode_trace.on && !decode_trace.active) ++decode_trace.count;
+                 }
+                 if (sp != nullptr && stepped) {   // (DS4_DRAFT_COST: the step's time by its rows in all)
+                     int rows_all = 0;
+diff --git a/src/ds4/ds4_model.cu b/src/ds4/ds4_model.cu
+index 7c796c9..e3e580d 100644
+--- a/src/ds4/ds4_model.cu
++++ b/src/ds4/ds4_model.cu
+@@ -10,6 +10,7 @@
+ //   moe(x): 6 of 384 routed experts (sqrt-softplus scores, biased top-k) + the shared expert
+ //   h = post * moe + comb^T h;  pre = f_pre
+ // and after the last layer logits = head(rmsnorm(sum_s pre[s] h[s])).
++#include <cuda_profiler_api.h>   // (Phase 8AL) cudaProfilerStart/Stop for the capture range
+ #include "ds4_model.hpp"
+ #include "ds4_borrow.hpp"
+ #include "ds4_cpu_exl3.hpp"
+@@ -625,6 +626,10 @@ struct Dev {
+     TopkScratch tks;                                   // a window's indexer top k over long rows (topk's segments)
+     unsigned long long* plan_ptr = nullptr;           // the decode path's VRAM experts (0: on the CPU lane)
+     int* cpu_any = nullptr;                           // the window's routing has a CPU-lane pick (route_publish's)
++    // (Phase 8BQ) the plan buffer for the position-dependent shape: [0] = ng (the compressed groups this window
++    // completes), [1] = g_first. Written per window; nothing reads it yet, so adding it cannot change a result.
++    int* ng_dev = nullptr;
++    int64_t* pos_dev = nullptr;                       // the window's p0, for the same purpose
+     uint8_t* eg_rows = nullptr;
+     uint16_t *emb_rows = nullptr, *ext = nullptr;   // the window's embedding rows; the window attention's rows
+     AttnScratch attn_scr;   // a few queries' selected compressed rows decoded (sparse_attn)
+@@ -680,6 +685,9 @@ struct Dev {
+     // (--parallel) a multi step's new compressed rows of each row's conversation gathered for the other groups' readers:
+     // kWin ckv rows, then kWin index-key rows
+     uint8_t* mstage = nullptr;
++    // (8CC) replicate's source staging: the source's g_first-offset rows gathered here before the host copy-out,
++    // so the staged memcpy's source pointer is stable (capture-ready)
++    uint8_t* rep_stage = nullptr;
+     // (DS4_MULTI_ATTN) a multi step's window buffers side by side, and the few-queries scratch for all its rows; the
+     // layer's plan of them (layer(), on this device's thread)
+     uint16_t* mext = nullptr;
+@@ -954,6 +962,12 @@ struct Layer {
+     // the window's raw rows (kv, then score) to replay the accepted ones
+     uint8_t* ring_bak = nullptr;
+     float *c_snap = nullptr, *c_rows = nullptr;
++    // the undo log (DS4_UNDO_LOG>0, Phase 8BL): the ring rows and the compressor's overwritten slots over the horizon,
++    // so restore() can rewind within it without a full Check.  undo_ring: H rows of win_rb(), index (pos % H).  undo_kv
++    // / undo_sc: H rows of hd floats, the compressor's overwritten slot (pos % ratio) each token, index (pos % H).
++    // nullptr when off (default): nothing allocated, nothing written - bit-identical to before.
++    uint8_t* undo_ring = nullptr;
++    float *undo_kv = nullptr, *undo_sc = nullptr;
+     unsigned long long* vram_tab = nullptr;     // device [n_exp]
+     std::vector<std::array<x3::Mat, 3>> vm;     // expert -> its gate, up, down as EXL3 views of its VRAM blob
+     std::vector<uint64_t> region_off;           // expert -> file region (offset, bytes, file)
+@@ -1400,6 +1414,7 @@ struct Model::Impl {
+     // by xfer_put / xfer_get (host-mapped rows and a flag, as the pipeline's groups hand theirs) instead of copies
+     // through pinned memory and events
+     int decode_trim = 0;
++    bool pipe_p2p = false; // (DS4_PIPE_P2P: experimental direct layer-pipeline peer copies)
+     unsigned d_xseq = 0;   // (DS4_DECODE_TRIM 8) the drafter's hand-off sequence (its flags only ever rise)
+     size_t dhand_x() const { return (size_t) kWin * ((size_t) g.hc * g.dim * 4 + 8 * 4); }   // (the x rows' offset)
+     size_t dhand_bytes() const { return dhand_x() + (size_t) kWin * g.dim * 4; }
+@@ -1521,6 +1536,10 @@ struct Model::Impl {
+     // the state
+     int64_t pos = 0;
+     std::vector<int32_t> toks, ctoks;
++    // the undo log (DS4_UNDO_LOG) covers positions [undo_log_from, pos): every write there is in the log.  A verify
++    // window's accepted rows are not logged (spec_win), so undo_log_from advances past them in rollback(); restore()
++    // rewinds from the log only at or after it, else it falls back to a full Check.
++    int64_t undo_log_from = 0;
+     struct Check {                    // the state at a position: every window ring, the compressors' partial groups
+         int64_t pos = -1;
+         std::vector<std::vector<uint8_t>> win;
+@@ -1545,12 +1564,15 @@ struct Model::Impl {
+     // device pointers stay here, the bound one's too.
+     struct SeqState {
+         int64_t pos = 0;
++        int64_t undo_log_from = 0;   // the undo log's coverage for this conversation (see Impl::undo_log_from)
+         std::vector<int32_t> toks, ctoks;
+         Check ck[3];
+         std::vector<Check> mk;
+         bool slot_held = false;
+         std::vector<uint8_t*> win;                   // [layer member] (sq_base[layer] + member)
+         std::vector<float*> c_kv, c_score;
++        std::vector<uint8_t*> undo_ring;             // the conversation's own undo log (DS4_UNDO_LOG), if on
++        std::vector<float*> undo_kv, undo_sc;
+         std::vector<std::vector<uint8_t*>> ckv, ik;   // [source][device]
+     };
+     std::vector<SeqState> sqs;   // empty: one conversation (Options::seqs 1)
+@@ -1770,6 +1792,17 @@ struct Model::Impl {
+         unsigned win = 0;   // (win_now at the tick that queued it)
+     };
+     static constexpr int kMaxSwaps = 8;
++    // (Phase 8AY) STRATA_DS4_CACHE_SCORE=1: heat a pick by the weight it carried, not just by the fact that it was
++    // picked. A pick with w x k = 1 is an ordinary one (uniform weights reproduce the old `+= 1` exactly, so the
++    // measured MARGIN/BONUS keep their scale); an expert that carried a token counts for more than one that barely
++    // won its slot. HybriMoE's score-based caching, reduced to the one line our bookkeeping needs.
++    static bool heat_scored() {
++        static const bool on = [] {
++            const char* v = ds4_env("STRATA_DS4_CACHE_SCORE");
++            return v != nullptr && std::atoi(v) != 0;
++        }();
++        return on;
++    }
+     // the swap rule: a CPU-lane expert in when its heat passes the coldest VRAM one's x margin + bonus; heat x decay
+     // every 256 tokens; at most `inflight` swaps under way (DS4_CACHE_MARGIN / _BONUS / _DECAY / _INFLIGHT)
+     static float env_f(const char* k, float d) { return std::getenv(k) ? (float) std::atof(std::getenv(k)) : d; }
+@@ -3749,6 +3782,10 @@ struct Model::Impl {
+                              decode_trim & 4 ? " the snapshot / latent copies one kernel each;" : "",
+                              decode_trim & 8 ? " the drafter's hand-offs by xfer;" : "");
+         }
++        if (const char* v = ds4_env("DS4_PIPE_P2P")) {
++            pipe_p2p = std::strcmp(v, "1") == 0;
++            if (pipe_p2p) std::fprintf(stderr, "ds4: DS4_PIPE_P2P=1: experimental direct pipeline peer copies requested\n");
++        }
+         if (const char* v = ds4_env("DS4_ROUTE_FUSE")) {   // (MAYA_DS4_ROUTE_FUSE)
+             if (std::strcmp(v, "1") != 0 && std::strcmp(v, "2") != 0 && std::strcmp(v, "0") != 0) {
+                 err = std::string("DS4_ROUTE_FUSE=") + v + ": 2, 1 or 0";
+@@ -4345,8 +4382,10 @@ struct Model::Impl {
+                       dalloc(d, d.tok, 16, err) && dalloc(d, d.emb_rows, W * D, err) &&
+                       dalloc(d, d.ext, ((size_t) g.win + W) * g.hd, err) && dalloc(d, d.xe, P * D, err) &&
+                       dalloc(d, d.xg, P * g.ff, err) && dalloc(d, d.xu, P * g.ff, err) && dalloc(d, d.xhh, P * g.ff, err) &&
+-                      dalloc(d, d.ed, P * D, err) && dalloc(d, d.plan_ptr, P, err) && dalloc(d, d.cpu_any, 1, err);
++                      dalloc(d, d.ed, P * D, err) && dalloc(d, d.plan_ptr, P, err) && dalloc(d, d.cpu_any, 1, err) &&
++                      dalloc(d, d.ng_dev, 2, err) && dalloc(d, d.pos_dev, 1, err);
+             if (!ok) return false;
++            if (!dalloc(d, d.rep_stage, (size_t) kWin * (ckv_rb() + ik_rb()), err)) return false;
+             CK(cudaMemset(d.cpu_any, 0, sizeof(int)));
+             d.attn_scr.max_t = kAttnScratchT;
+             d.attn_scr.cap = (int) topk_stride();
+@@ -6847,6 +6886,18 @@ struct Model::Impl {
+                 }
+             }
+             if (!dalloc(d, l.win, (size_t) g.win * win_rb(), err, &d.caches)) return false;
++            if (undo_h() > 0 && !l.mtp) {   // (the undo log's overwritten rows: H ring rows + H compressor slot rows)
++                const bool host = undo_host();
++                if (host ? !hmap(l.undo_ring, (size_t) undo_h() * win_rb(), err)
++                         : !dalloc(d, l.undo_ring, (size_t) undo_h() * win_rb(), err))
++                    return false;
++                if (l.kv_src && l.ratio > 1 &&
++                    (host ? (!hmap(l.undo_kv, (size_t) undo_h() * g.hd, err) ||
++                             !hmap(l.undo_sc, (size_t) undo_h() * g.hd, err))
++                          : (!dalloc(d, l.undo_kv, (size_t) undo_h() * g.hd, err) ||
++                             !dalloc(d, l.undo_sc, (size_t) undo_h() * g.hd, err))))
++                    return false;
++            }
+             if (spec_bufs() && !l.mtp) {   // (a verify window's backups: the rows and states a rejected draft undoes)
+                 // (--parallel: a multi step's verify windows share the window's rows - the ring's backups and the
+                 //  compressor's rows by row - and each its own compressor snapshot, one a conversation)
+@@ -9626,6 +9677,9 @@ struct Model::Impl {
+             q.win.assign((size_t) nmem, nullptr);
+             q.c_kv.assign((size_t) nmem, nullptr);
+             q.c_score.assign((size_t) nmem, nullptr);
++            q.undo_ring.assign((size_t) nmem, nullptr);
++            q.undo_kv.assign((size_t) nmem, nullptr);
++            q.undo_sc.assign((size_t) nmem, nullptr);
+             q.ckv.assign(srcs.size(), std::vector<uint8_t*>(devs.size(), nullptr));
+             q.ik.assign(srcs.size(), std::vector<uint8_t*>(devs.size(), nullptr));
+             for (size_t i = 0; i < L.size(); ++i)
+@@ -9636,6 +9690,9 @@ struct Model::Impl {
+                         q.win[k] = l.win;
+                         q.c_kv[k] = l.c_kv;
+                         q.c_score[k] = l.c_score;
++                        q.undo_ring[k] = l.undo_ring;
++                        q.undo_kv[k] = l.undo_kv;
++                        q.undo_sc[k] = l.undo_sc;
+                         continue;
+                     }
+                     Dev& d = devs[(size_t) l.dev];
+@@ -9643,6 +9700,17 @@ struct Model::Impl {
+                     if (l.c_kv != nullptr && !dalloc(d, q.c_kv[k], (size_t) l.ratio * g.hd, err, &d.caches)) return false;
+                     if (l.c_score != nullptr && !dalloc(d, q.c_score[k], (size_t) l.ratio * g.hd, err, &d.caches))
+                         return false;
++                    const bool uhost = undo_host();
++                    if (undo_h() > 0 && l.undo_ring != nullptr &&
++                        (uhost ? !hmap(q.undo_ring[k], (size_t) undo_h() * win_rb(), err)
++                               : !dalloc(d, q.undo_ring[k], (size_t) undo_h() * win_rb(), err, &d.caches)))
++                        return false;
++                    if (undo_h() > 0 && l.undo_kv != nullptr &&
++                        (uhost ? (!hmap(q.undo_kv[k], (size_t) undo_h() * g.hd, err) ||
++                                  !hmap(q.undo_sc[k], (size_t) undo_h() * g.hd, err))
++                               : (!dalloc(d, q.undo_kv[k], (size_t) undo_h() * g.hd, err, &d.caches) ||
++                                  !dalloc(d, q.undo_sc[k], (size_t) undo_h() * g.hd, err, &d.caches))))
++                        return false;
+                 }
+             for (size_t j = 0; j < srcs.size(); ++j)
+                 for (size_t di = 0; di < devs.size(); ++di) {
+@@ -9684,6 +9752,7 @@ struct Model::Impl {
+     void seq_park() {
+         SeqState& q = sqs[(size_t) sq_bound];
+         q.pos = pos;
++        q.undo_log_from = undo_log_from;
+         q.toks = std::move(toks);
+         q.ctoks = std::move(ctoks);
+         for (int i = 0; i < 3; ++i) q.ck[i] = std::move(ck[i]);
+@@ -9696,6 +9765,8 @@ struct Model::Impl {
+     void seq_unpark() {
+         SeqState& q = sqs[(size_t) sq_bound];
+         pos = q.pos;
++        undo_log_from = q.undo_log_from;
++        if (undo_log_from > pos) undo_log_from = pos;   // (never a floor past the state; 8BO.3)
+         toks = std::move(q.toks);
+         ctoks = std::move(q.ctoks);
+         for (int i = 0; i < 3; ++i) ck[i] = std::move(q.ck[i]);
+@@ -9716,6 +9787,9 @@ struct Model::Impl {
+                 l.win = q.win[k];
+                 l.c_kv = q.c_kv[k];
+                 l.c_score = q.c_score[k];
++                l.undo_ring = q.undo_ring[k];
++                l.undo_kv = q.undo_kv[k];
++                l.undo_sc = q.undo_sc[k];
+             }
+         if (mtp_only) return;
+         for (size_t j = 0; j < srcs.size(); ++j)
+@@ -9729,7 +9803,7 @@ struct Model::Impl {
+         seq_park();
+         sq_bound = s;
+         seq_point(s);
+-        seq_unpark();
++        seq_unpark();   // (the conversation's own undo log + undo_log_from come back with it: nothing to reset)
+     }
+     int64_t seq_pos(int s) const { return sqs.empty() || s == sq_bound ? pos : sqs[(size_t) s].pos; }
+     const std::vector<int32_t>& seq_tokens(int s) const {
+@@ -9741,6 +9815,7 @@ struct Model::Impl {
+         toks.clear();
+         ctoks.clear();
+         slot_held = false;
++        undo_log_from = 0;
+         ck[0].pos = ck[1].pos = ck[2].pos = -1;
+         mk.clear();
+         for (Layer& l0 : L)
+@@ -9794,6 +9869,35 @@ struct Model::Impl {
+         }();
+         return n;
+     }
++    // the undo log's horizon in tokens (DS4_UNDO_LOG, 0: off - restore() uses full Check snapshots only).  When off the
++    // per-layer buffers are not allocated and the write hooks are not taken, so the run is bit-identical to before.
++    static int undo_h() {
++        static const int n = [] {
++            const char* v = ds4_env("DS4_UNDO_LOG");
++            return v != nullptr ? std::max(0, std::atoi(v)) : 0;
++        }();
++        return n;
++    }
++    // DS4_UNDO_HOST=1: the undo log in pinned host memory (device-mapped) instead of VRAM, trading the ~132 MB/GPU it
++    // would take from the expert cache for a few % of PCIe traffic on the hot path - and freeing VRAM for a much longer
++    // horizon (host RAM is cheap here: 0 = VRAM, the default).
++    static bool undo_host() {
++        static const bool on = [] {
++            const char* v = ds4_env("DS4_UNDO_HOST");
++            return v != nullptr && std::atoi(v) != 0;
++        }();
++        return on;
++    }
++    // DS4_UNDO_VERIFY=1: after a log rewind, read the ring back and check every touched slot against the log's own
++    // p_min formula (the value the kernel must have written).  Off by default; it catches the one fault that would
++    // otherwise be silent - a write the log failed to record - on one ring layer and one compressor per device.
++    static bool undo_verify_on() {
++        static const bool on = [] {
++            const char* v = ds4_env("DS4_UNDO_VERIFY");
++            return v != nullptr && std::atoi(v) != 0;
++        }();
++        return on;
++    }
+     // the state at pos as a restore point a request asked for (shared: the end of a shared start, given up last); one
+     // at this position already is kept (it holds the same state), else the one mark_victim() picks makes room
+     void mark(bool shared) {
+@@ -9831,6 +9935,10 @@ struct Model::Impl {
+         return latest_point(at, limit, pos);
+     }
+     int64_t restorable(int64_t limit) const {
++        // the undo log (DS4_UNDO_LOG) can rewind to `limit` itself when the distance is within the horizon and no spec
++        // gap lies in the range - no checkpoint needed there, which is what makes a mid-prompt edit cheap without marks
++        const int uh = undo_h();
++        if (uh > 0 && limit > 0 && limit <= pos && pos - limit <= (int64_t) uh && limit >= undo_log_from) return limit;
+         const int b = best_check(limit);
+         return b < 0 ? -1 : check_at(b).pos;
+     }
+@@ -9865,7 +9973,167 @@ struct Model::Impl {
+         return n;
+     }
+ 
++    // a verify window's ACCEPTED ring rows into the undo log (single conversation): row i < keep from ring_bak[i] and
++    // the compressor's overwritten slot (snap[slot] if i < ratio, else the window's raw row i - ratio).
++    void undo_commit_single(int64_t p0, int keep) {
++        const int uh = undo_h();
++        std::vector<UndoCommitBatch> cb(devs.size());
++        for (int il = 0; il < g.nl; ++il)
++            for (int m = 0; m < L[(size_t) il].nm; ++m) {
++                Layer& l = member(L[(size_t) il], m);
++                if (l.undo_ring == nullptr && l.undo_kv == nullptr) continue;
++                UndoCommitBatch& b = cb[(size_t) l.dev];
++                b.undo_ring[b.n] = l.undo_ring;
++                b.ring_bak[b.n] = l.ring_bak;
++                b.undo_kv[b.n] = l.undo_kv;
++                b.undo_sc[b.n] = l.undo_sc;
++                b.snap[b.n] = l.c_snap;
++                b.kv_rows[b.n] = l.c_rows;
++                b.sc_rows[b.n] = l.c_rows ? l.c_rows + (size_t) kWin * g.hd : nullptr;
++                b.ratio[b.n++] = l.ratio;
++            }
++        for (size_t di = 0; di < devs.size(); ++di)
++            if (cb[di].n > 0) {
++                cudaSetDevice(devs[di].id);
++                undo_commit_batch(cb[di], p0, keep, uh, g.hd, devs[di].st);
++            }
++    }
++
++    // DS4_UNDO_VERIFY: after a log rewind, read the ring back and check every slot the rewind touched against the
++    // value ring_undo_batch/comp_undo_batch must have written for it (the per-slot p_min formulation in
++    // ds4_undo_log.hpp).  One ring layer and one compressor per device: a systematic (missed-hook) fault shows up at
++    // once; a one-off would need the whole set.  Rewinds are rare, so the blocking read-back is moot.
++    bool undo_verify(int64_t limit, int64_t hi) {
++        const int uh = undo_h();
++        if (uh <= 0) return true;
++        const bool uhost = undo_host();
++        auto rd = [](void* dst, const void* src, size_t n) -> bool {
++            if (cudaMemcpy(dst, src, n, cudaMemcpyDeviceToHost) != cudaSuccess) {
++                std::fprintf(stderr, "undo-verify: read-back failed: %s\n", cudaGetErrorString(cudaGetLastError()));
++                return false;
++            }
++            return true;
++        };
++        size_t checked = 0, bad = 0;
++        for (size_t di = 0; di < devs.size(); ++di) {
++            Dev& d = devs[(size_t) di];
++            cudaSetDevice(d.id);
++            const Layer* rl = nullptr;
++            const Layer* cl = nullptr;
++            for (size_t i = 0; i < L.size() && (rl == nullptr || cl == nullptr); ++i)
++                for (int m = 0; m < L[i].nm; ++m) {
++                    Layer& l = member(L[i], m);
++                    if (l.dev != (int) di) continue;
++                    if (rl == nullptr && l.undo_ring != nullptr) rl = &l;
++                    if (cl == nullptr && l.undo_kv != nullptr) cl = &l;
++                }
++            if (rl != nullptr) {
++                const int win = g.win;
++                const size_t rb = win_rb();
++                std::vector<uint8_t> ring((size_t) win * rb), row(rb);
++                if (!rd(ring.data(), rl->win, ring.size())) return false;
++                for (int s = 0; s < win; ++s) {
++                    const int64_t pmin = limit + ((s - limit) % win + win) % win;
++                    if (pmin > hi - 1) continue;
++                    const int64_t lr = (pmin % uh + uh) % uh;
++                    if (uhost)
++                        std::memcpy(row.data(), rl->undo_ring + (size_t) lr * rb, rb);
++                    else if (!rd(row.data(), rl->undo_ring + (size_t) lr * rb, rb))
++                        return false;
++                    ++checked;
++                    if (std::memcmp(ring.data() + (size_t) s * rb, row.data(), rb) != 0) ++bad;
++                }
++            }
++            if (cl != nullptr) {
++                const int ratio = cl->ratio;
++                const size_t hd = (size_t) g.hd;
++                std::vector<float> stv((size_t) ratio * hd), row(hd);
++                if (!rd(stv.data(), cl->c_kv, stv.size() * sizeof(float))) return false;
++                for (int s = 0; s < ratio; ++s) {
++                    const int64_t pmin = limit + ((s - limit) % ratio + ratio) % ratio;
++                    if (pmin > hi - 1) continue;
++                    const int64_t lr = (pmin % uh + uh) % uh;
++                    if (uhost)
++                        std::memcpy(row.data(), cl->undo_kv + (size_t) lr * hd, hd * sizeof(float));
++                    else if (!rd(row.data(), cl->undo_kv + (size_t) lr * hd, hd * sizeof(float)))
++                        return false;
++                    ++checked;
++                    if (std::memcmp(stv.data() + (size_t) s * hd, row.data(), hd * sizeof(float)) != 0) ++bad;
++                }
++            }
++        }
++        std::fprintf(stderr, "undo-verify: %s (%zu slots checked, %zu bad)\n", bad == 0 ? "OK" : "FAIL", checked, bad);
++        return bad == 0;
++    }
++
++    // restore()'s undo-log path: rewind the ring and the compressor partials from pos back to limit (the log covers
++    // it), then the same bookkeeping as restore()'s tail.  The compressed-KV source and the index keys are indexed by
++    // position, so they are left in place and re-written when the prompt is read again from limit.
++    void undo_rewind(int64_t limit) {
++        const int uh = undo_h();
++        const int64_t from = pos;   // (for the log line: how far back, and to where)
++        std::vector<UndoBatch> rb(devs.size());
++        std::vector<CompUndoBatch> cb(devs.size());
++        for (size_t i = 0; i < L.size(); ++i)
++            for (int m = 0; m < L[i].nm; ++m) {
++                Layer& l = member(L[i], m);
++                if (l.undo_ring != nullptr) {
++                    UndoBatch& b = rb[(size_t) l.dev];
++                    b.ring[b.n] = l.win;
++                    b.log[b.n++] = l.undo_ring;
++                }
++                if (l.undo_kv != nullptr) {
++                    CompUndoBatch& c = cb[(size_t) l.dev];
++                    c.kv_state[c.n] = l.c_kv;
++                    c.score_state[c.n] = l.c_score;
++                    c.log_kv[c.n] = l.undo_kv;
++                    c.log_sc[c.n] = l.undo_sc;
++                    c.ratio[c.n++] = l.ratio;
++                }
++            }
++        for (size_t di = 0; di < devs.size(); ++di) {
++            cudaSetDevice(devs[di].id);
++            if (rb[di].n > 0) ring_undo_batch(rb[di], limit, pos, g.win, uh, g.hd, devs[di].st);
++            if (cb[di].n > 0) comp_undo_batch(cb[di], limit, pos, uh, g.hd, devs[di].st);
++            cudaStreamSynchronize(devs[di].st);
++        }
++        if (undo_verify_on()) undo_verify(limit, pos);   // (pos is still the pre-rewind end here)
++        pos = limit;
++        toks.resize((size_t) pos);
++        ctoks.resize((size_t) pos);
++        slot_held = false;
++        for (Check& o2 : ck)   // a later checkpoint saw tokens the state no longer has
++            if (o2.pos > pos) o2.pos = -1;
++        mk.erase(std::remove_if(mk.begin(), mk.end(), [this](const Check& x) { return x.pos > pos; }), mk.end());
++        for (Check& x : mk)   // (a mark gone back to: in use)
++            if (x.pos == pos) x.used = ++mark_clock;
++        // DS4_UNDO_LOG fired: an edit's rewind reused the conversation's own KV instead of a full re-read.  stderr only
++        // (device printf never reaches the log), and only on this path - a normal prompt (continuation / new) never
++        // gets here, so the common case pays nothing.
++        st.undo_hits++;
++        st.undo_reused += limit;             // (the kept prefix: the tokens this rewind reused)
++        st.undo_rewound += from - limit;     // (the tokens the log rewound: pos - limit)
++        std::fprintf(stderr, "undo: rewound %lld tokens (from %lld back to %lld), DS4_UNDO_LOG=%d\n",
++                     (long long) (from - limit), (long long) from, (long long) limit, uh);
++    }
++
+     bool restore(int64_t limit) {
++        const int uh = undo_h();
++        // the undo-log path: rewind within the horizon (and with no spec gap in the range) instead of a full Check
++        if (uh > 0 && limit > 0 && limit <= pos && pos - limit <= (int64_t) uh && limit >= undo_log_from) {
++            undo_rewind(limit);
++            return true;
++        }
++        if (uh > 0) {   // (an edit that the undo log did not cover: say why, then fall back to a Check)
++            st.undo_misses++;
++            std::fprintf(stderr, "undo: miss (pos %lld, limit %lld, horizon %d, undo_log_from %lld: %s)\n",
++                         (long long) pos, (long long) limit, uh, (long long) undo_log_from,
++                         (limit <= 0)                     ? "no prefix to keep"
++                         : (limit > pos)                  ? "limit past the end"
++                         : (pos - limit > (int64_t) uh)   ? "beyond the horizon"
++                         : (limit < undo_log_from)        ? "below the log's floor (slot-loaded content)"
++                                                          : "a spec gap in the range");
++        }
+         const int b = best_check(limit);
+         if (b < 0) return false;
+         const Check& c = check_at(b);
+@@ -9886,6 +10154,9 @@ struct Model::Impl {
+             cudaStreamSynchronize(d.st);
+         }
+         pos = c.pos;
++        if (undo_log_from > pos) undo_log_from = pos;   // (a checkpoint fallback below a slot-loaded conversation's
++                                                        //  load point must not leave the log's floor past the state;
++                                                        //  8BO.3: a stale floor made every later rewind miss)
+         toks.resize((size_t) pos);
+         ctoks.resize((size_t) pos);
+         slot_held = false;
+@@ -10270,6 +10541,7 @@ struct Model::Impl {
+             return false;
+         }
+         pos = n_pos;
++        undo_log_from = pos;   // (the slot's ring/compressor were loaded, not the undo log: trust it only from here)
+         toks.swap(toks_in);
+         ctoks.resize((size_t) pos);
+         for (size_t i = 0; i < (size_t) pos; ++i)
+@@ -15245,7 +15517,7 @@ struct Model::Impl {
+                         const int e = r.ids[t][i];
+                         if (e < 0 || e >= l.n_exp) continue;
+                         ++pr[e];
+-                        l.heat[(size_t) e] += 1.0f;
++                        l.heat[(size_t) e] += heat_scored() ? r.w[t][i] * (float) l.k_exp : 1.0f;
+                         if (fl != nullptr) {
+                             ++st.ahead_picks;
+                             st.ahead_hit_k += fl[e] & 1;
+@@ -17467,6 +17739,7 @@ struct Model::Impl {
+         }
+         drafts_q = false;
+         rollback(p0, T, m + 1);
++
+         if (!seed_drafter(p0, m + 1, 0, err)) return false;
+         accepted = m;
+         st.drafts_offered += n;
+@@ -17481,6 +17754,7 @@ struct Model::Impl {
+     // a verified window keeps its first `keep` positions: the ring rows and the compressors' state of the rest undone
+     // (the compressed KV and the index keys past them are written again when those positions come)
+     void rollback(int64_t p0, int T, int keep) {
++        if (undo_h() > 0 && keep > 0) undo_commit_single(p0, keep);   // log the accepted spec rows for restore()
+         if (keep >= T) return;
+         // the ring rows: one launch a device for all its layers (a launch a layer and member was ~300 on 8-way tensor
+         // parallel, a millisecond of the host's before the next draft)
+@@ -17540,6 +17814,25 @@ struct Model::Impl {
+ 
+     // ---- a window: T tokens at positions pos .. pos + T - 1 through every layer; the logits of its last `logits` rows
+     bool step(int token, bool want_logits, std::string& err) {
++        // (Phase 8AL) STRATA_DS4_PROF=<start>[,<len>]: bracket decode steps in a CUDA profiler range so
++        // `nsys profile --capture-range=cudaProfilerApi` collects exactly those and nothing of the load.
++        static int prof_start = -2, prof_len = 2, prof_step = 0;
++        if (prof_start == -2) {
++            prof_start = -1;
++            if (const char* v = std::getenv("STRATA_DS4_PROF")) {
++                const int a = std::atoi(v);
++                const char* c = std::strchr(v, ',');
++                if (a >= 0) { prof_start = a; prof_len = c ? std::max(1, std::atoi(c + 1)) : 2; }
++            }
++            if (prof_start >= 0)
++                std::fprintf(stderr, "ds4: profiler range on: decode steps %d..%d\n", prof_start,
++                             prof_start + prof_len);
++        }
++        if (prof_start >= 0) {
++            if (prof_step == prof_start) cudaProfilerStart();
++            if (prof_step == prof_start + prof_len) cudaProfilerStop();
++            ++prof_step;
++        }
+         main_at.store("a decode step", std::memory_order_relaxed);
+         tok_ab_begin();
+         const bool ok = forward(&token, 1, want_logits ? 1 : 0, err);
+@@ -17878,7 +18171,7 @@ struct Model::Impl {
+                 CK(cudaMemcpyAsync(sw, l.win, (size_t) g.win * win_rb(), cudaMemcpyDeviceToDevice, s));
+                 if (wp.snap_t[i] > 0) ext_to_ring(c.ext, sw, p0, g.win, wp.snap_t[i], HD, s, nullptr);
+             }
+-            ext_to_ring(c.ext, l.win, p0, g.win, T, HD, s, nullptr);
++            ext_to_ring(c.ext, l.win, p0, g.win, T, HD, s, nullptr, undo_h() > 0 ? l.undo_ring : nullptr, undo_h());
+         }
+         const uint8_t* ckv = nullptr;
+         const long long ss = (long long) o.max_context + 64;
+@@ -17908,7 +18201,8 @@ struct Model::Impl {
+                             CK(cudaMemcpyAsync(ssc + (size_t) sl * HD, sc, (size_t) HD * 4, cudaMemcpyDeviceToDevice, s));
+                         }
+                     }
+-                    compress_win(c.ckr, c.cgr, l.c_kv, l.c_score, R, (int) p0, T, HD, l.c_norm, g.eps, c.latent, s);
++                    compress_win(c.ckr, c.cgr, l.c_kv, l.c_score, R, (int) p0, T, HD, l.c_norm, g.eps, c.latent, s,
++                                 undo_h() > 0 ? l.undo_kv : nullptr, undo_h() > 0 ? l.undo_sc : nullptr, undo_h());
+                 }
+             }
+             const int clen_max = (int) ((p0 + T) / R);
+@@ -21085,6 +21379,11 @@ struct Model::Impl {
+         Dev& d = devs[(size_t) di];
+         cudaSetDevice(d.id);
+         cudaStream_t s = d.st;
++        {   // (8CC) publish the window's position once, before the layer loop (the first layer's ring and finishes read it)
++            static int64_t sp0;
++            sp0 = p0;
++            CK(cudaMemcpyAsync(d.pos_dev, &sp0, sizeof sp0, cudaMemcpyHostToDevice, s));
++        }
+         const int D = g.dim, H = g.hc;
+         bool started = false;
+         std::vector<char> got(srcs.size(), 0);
+@@ -21102,7 +21401,26 @@ struct Model::Impl {
+                     init_pre(d.pre, T, s);
+                 } else {
+                     const Dev& a = devs[(size_t) L[(size_t) il - 1].dev];
+-                    xfer_get(hand_xfer(a.hand, d, T, false), a.hand_flag, wp.win, s);
++                    const bool p2p = pipe_p2p && T == 1 && a.id != d.id;
++                    if (p2p) {
++                        int can = 0;
++                        if (cudaDeviceCanAccessPeer(&can, d.id, a.id) != cudaSuccess || !can) {
++                            err = "DS4_PIPE_P2P: peer access unavailable";
++                            return false;
++                        }
++                        cudaSetDevice(d.id);
++                        CK(cudaStreamWaitEvent(s, a.ev_out, 0));
++                        const size_t nh = (size_t) T * H * D * 4, np = (size_t) T * 8 * 4,
++                                     nk = (size_t) T * topk_stride() * 4, nc = (size_t) T * cand_stride() * 4;
++                        CK(cudaMemcpyPeerAsync(d.h, d.id, a.h, a.id, nh, s));
++                        CK(cudaMemcpyPeerAsync(d.pre, d.id, a.pre, a.id, np, s));
++                        CK(cudaMemcpyPeerAsync(d.topk, d.id, a.topk, a.id, nk, s));
++                        CK(cudaMemcpyPeerAsync(d.cand, d.id, a.cand, a.id, nc, s));
++                        std::fprintf(stderr, "ds4: DS4_PIPE_P2P active CUDA%d -> CUDA%d (%zu bytes)\n", a.id, d.id,
++                                     nh + np + nk + nc);
++                    } else {
++                        xfer_get(hand_xfer(a.hand, d, T, false), a.hand_flag, wp.win, s);
++                    }
+                 }
+             }
+             // the compressed KV / index keys another group's source layer wrote this window
+@@ -21135,7 +21453,20 @@ struct Model::Impl {
+             if (!layer(L0, mi, p0, T, wp, err)) return false;
+             if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, il, p0, T);
+             const bool last = il + 1 == g.nl || L[(size_t) il + 1].grp != L0.grp;
+-            if (last && mi == 0 && il + 1 < g.nl) xfer_put(hand_xfer(d.hand, d, T, true), d.hand_flag, wp.win, d.xcnt, s);
++            if (last && mi == 0 && il + 1 < g.nl) {
++                const Dev& next = devs[(size_t) L[(size_t) il + 1].dev];
++                const bool p2p = pipe_p2p && T == 1 && d.id != next.id;
++                if (p2p) {
++                    int can = 0;
++                    if (cudaDeviceCanAccessPeer(&can, d.id, next.id) != cudaSuccess || !can) {
++                        err = "DS4_PIPE_P2P: peer access unavailable";
++                        return false;
++                    }
++                    CK(cudaEventRecord(d.ev_out, s));
++                } else {
++                    xfer_put(hand_xfer(d.hand, d, T, true), d.hand_flag, wp.win, d.xcnt, s);
++                }
++            }
+         }
+         if (d.grp == devs[(size_t) head_dev].grp && !head_rows_dev(di, T, err)) return false;
+         if (!idle_ev.empty()) {   // (its turn over: the expert cache's copies from here, copy_open)
+@@ -21147,13 +21478,17 @@ struct Model::Impl {
+ 
+     // a source's new cache rows (src on device `from`, bytes of them) to the same place of its other devices' copies,
+     // through pinned memory: the copy out on the source's stream, each copy in on its device's stream after it
+-    bool replicate(std::vector<uint8_t*>& copies, uint8_t* stage, cudaEvent_t ev, const uint8_t* src, size_t at,
+-                   size_t bytes, int from, std::string& err) {
++    bool replicate(std::vector<uint8_t*>& copies, uint8_t* stage, cudaEvent_t ev, const uint8_t* src, size_t rb,
++                   size_t at, size_t bytes, int from, std::string& err) {
+         bool any = false;
+         for (size_t od = 0; od < devs.size(); ++od) any = any || (copies[od] != nullptr && (int) od != from);
+         if (!any) return true;
+         Dev& d = devs[(size_t) from];
+-        CK(cudaMemcpyAsync(stage, src, bytes, cudaMemcpyDeviceToHost, d.st));
++        // (8CC) the source's row offset (g_first) is read from the plan buffer on the device, so the staged copy's
++        // source pointer is stable (capture-ready): gather src + g_first * rb into d.rep_stage, then copy out.
++        if (bytes > 0)
++            rep_gather(d.rep_stage, src, d.ng_dev + 1, rb, bytes, d.st);
++        CK(cudaMemcpyAsync(stage, d.rep_stage, bytes, cudaMemcpyDeviceToHost, d.st));
+         CK(cudaEventRecord(ev, d.st));
+         for (size_t od = 0; od < devs.size(); ++od) {
+             if (copies[od] == nullptr || (int) od == from) continue;
+@@ -21216,6 +21551,13 @@ struct Model::Impl {
+             const int64_t g_first = p0 / R;              // the first group whose last position is >= p0
+             const int64_t g_end = (p0 + T) / R;          // groups completed by p0 + T - 1
+             const int ng = (int) std::max<int64_t>(0, g_end - g_first);
++            {   // (8BQ) publish the window's shape and position for the graph port. These are function statics: a
++                // captured memcpy node needs a source address that does not move between replays.
++                static int stable[2];          // (8BQ) ng_dev is 2 ints (8 B): int64 here overflowed the allocation
++                stable[0] = ng;
++                stable[1] = (int) g_first;
++                CK(cudaMemcpyAsync(d.ng_dev, stable, sizeof stable, cudaMemcpyHostToDevice, s));
++            }
+             if (l.kv_src) {
+                 if (R == 1) {
+                     Finish fc;
+@@ -21265,7 +21607,11 @@ struct Model::Impl {
+                             CK(cudaMemcpyAsync(rows + (size_t) kWin * HD, cgr, nr, cudaMemcpyDeviceToDevice, s));
+                         }
+                     }
+-                    compress_win(ckr, cgr, A.c_kv, A.c_score, R, (int) p0, T, HD, l.c_norm, g.eps, d.latent, s);
++                    // (the undo log tracks the bound conversation's committed writes only: not a verify window, and
++                    //  A.c_kv == l.c_kv - the bound conversation's partial, not a parked conversation's)
++                    const bool undo_comp = !spec_win && undo_h() > 0 && A.c_kv == l.c_kv;
++                    compress_win(ckr, cgr, A.c_kv, A.c_score, R, (int) p0, T, HD, l.c_norm, g.eps, d.latent, s,
++                                 undo_comp ? l.undo_kv : nullptr, undo_comp ? l.undo_sc : nullptr, undo_h(), d.pos_dev);
+                 }
+             }
+             Rows lim;
+@@ -21277,8 +21623,34 @@ struct Model::Impl {
+             }
+             if (l.ix_src) {
+                 Src& ks = srcs[(size_t) l.ik_src];
+-                if (l.owns_k && ng > 0) {
+-                    if (!mv(d, {job(l.i_wk, d.latent, d.ikr, ng, HD, g.ix_hd)}, err)) return false;
++                // Optional single-token shortcut: when every currently
++                // compressed position is selected, scores and top-k ranking
++                // cannot change the selected set. Candidate-restricted
++                // layers keep the original path.
++                static const bool index_all_fast = [] {
++                    const char* v = std::getenv("DS4_INDEX_ALL_FAST");
++                    return v != nullptr && std::atoi(v) != 0;
++                }();
++                static const bool index_query_skip = [] {
++                    const char* v = std::getenv("DS4_INDEX_QUERY_SKIP");
++                    return v != nullptr && std::atoi(v) != 0;
++                }();
++                const bool skip_query = index_all_fast && index_query_skip && T == 1 && !l.uses_cand &&
++                                        lim.n[0] <= g.ix_topk;
++                static const bool cand_all_fast = [] {
++                    const char* v = std::getenv("DS4_INDEX_CAND_ALL_FAST");
++                    return v != nullptr && std::atoi(v) != 0;
++                }();
++                const int avail_blocks = g.cand_blk > 0 ? (lim.n[0] + g.cand_blk - 1) / g.cand_blk : 0;
++                const bool cand_all = cand_all_fast && T == 1 && l.cand_src && !l.uses_cand &&
++                                      lim.n[0] <= g.ix_topk && avail_blocks <= g.cand_topk;
++                // (8BQ) shape-stable on the DECODE path only (a window: T <= kWin, ng <= 9, and the GEMV's
++                // column bound is NC <= 16). Prefill keeps the old guard and the old sizes exactly - padding a
++                // chunk's row count past NC is what made 8BT's attempt crawl.
++                const bool pad_ok = T <= kWin;
++                const int ng_max_i = pad_ok ? std::min(16, (int) ((T + R - 1) / R) + 1) : ng;
++                if (l.owns_k && (pad_ok || ng > 0)) {
++                    if (!mv(d, {job(l.i_wk, d.latent, d.ikr, pad_ok ? ng_max_i : ng, HD, g.ix_hd)}, err)) return false;
+                     Finish fi;
+                     fi.w = l.ik_norm;
+                     fi.eps = g.eps;
+@@ -21287,17 +21659,25 @@ struct Model::Impl {
+                     fi.pos_step = R;
+                     fi.freqs = freqs;
+                     fi.quant = 3;
+-                    fi.pdst = (*A.ik)[(size_t) l.dev] + (size_t) g_first * ik_rb();
++                    fi.pdst = (*A.ik)[(size_t) l.dev];   // (8BX) offset from the plan buffer
+                     fi.pdst_stride = (long long) ik_rb();
+-                    finish(d.ikr, ng, g.ix_hd, g.ix_hd, fi, s);
++                    fi.off_stride = (long long) ik_rb();
++                    fi.p0_dev = d.pos_dev;   // (8CC) g_first = p0/R, ng = (p0+T)/R - p0/R on the device
++                    fi.T = T;
++                    finish(d.ikr, pad_ok ? ng_max_i : ng, g.ix_hd, g.ix_hd, fi, s);   // (8BQ) masked past ng on the decode path
+                     // (the pinned stage at the run's own rows: a multi step's runs replicate one after another, and
+                     //  the next run's copy out must not overwrite rows another device has not copied in yet)
+-                    if (!wp.par && !replicate((*A.ik), ks.h_ik + (size_t) r0 * ik_rb(), ks.ev_ik, fi.pdst,
++                    if (!wp.par && !replicate((*A.ik), ks.h_ik + (size_t) r0 * ik_rb(), ks.ev_ik, fi.pdst, ik_rb(),
+                                               (size_t) g_first * ik_rb(),
+                                               (size_t) ng * ik_rb(), l.dev, err))
+                         return false;
+                 }
+-                if (clen_max > 0) {
++                if (skip_query) {
++                    // The all-position path needs only the positional index;
++                    // index-query projections and score/rank work have no
++                    // remaining consumer. Index-key generation above stays.
++                    iota_rows(topk_r, T, lim.n[0], (int) topk_stride(), s);
++                } else if (clen_max > 0) {
+                     if (!mv(d, {job(l.i_wq_b, qr, d.iq, T, g.q_lora, (size_t) g.ix_heads * g.ix_hd)}, err)) return false;
+                     Finish fi;
+                     fi.rd = g.rd;
+@@ -21313,7 +21693,12 @@ struct Model::Impl {
+                     bool restrict_ = false;
+                     for (int t = 0; t < T; ++t)
+                         restrict_ = restrict_ || (lim.n[t] + g.cand_blk - 1) / g.cand_blk > g.cand_topk;
+-                    if (l.uses_cand && restrict_) {
++                    if (cand_all) {
++                        iota_rows(cand_r, T, avail_blocks, (int) cand_stride(), s);
++                        iota_rows(topk_r, T, lim.n[0], (int) topk_stride(), s);
++                    } else if (index_all_fast && T == 1 && !l.uses_cand && lim.n[0] <= g.ix_topk) {
++                        iota_rows(topk_r, T, lim.n[0], (int) topk_stride(), s);
++                    } else if (l.uses_cand && restrict_) {
+                         Rows cl;   // the candidate positions of each query: its blocks x blk
+                         int nmax = 0;
+                         for (int t = 0; t < T; ++t) {
+@@ -21367,31 +21752,44 @@ struct Model::Impl {
+                     }
+                 }
+             }
+-            if (l.kv_src && ng > 0) {
++            if (l.kv_src) {   // (8BQ) unconditional at ng_max, masked on the device: the launch set no longer
++                              // depends on the position, which is what capture needs. Masked rows write nothing,
++                              // so the result is bit-identical.
++                const int ng_max = (int) ((T + R - 1) / R) + 1;   // from T and R alone, never from p0
+                 Finish fc;
+                 fc.rd = g.rd;
+                 fc.pos = (int) (g_first * R);
+                 fc.pos_step = R;
+                 fc.freqs = freqs;
+                 fc.quant = 2;
+-                fc.pdst = (*A.ckv)[(size_t) l.dev] + (size_t) g_first * ckv_rb();
++                fc.pdst = (*A.ckv)[(size_t) l.dev];   // (8BX) the row offset now comes from the plan buffer
+                 fc.pdst_stride = (long long) ckv_rb();
+-                finish(d.latent, ng, HD, HD, fc, s);
+-                if (!wp.par && !replicate((*A.ckv), sr.h_ckv + (size_t) r0 * ckv_rb(), sr.ev_ckv, fc.pdst,
++                fc.off_stride = (long long) ckv_rb();
++                fc.p0_dev = d.pos_dev;   // (8CC) g_first = p0/R, ng = (p0+T)/R - p0/R on the device
++                fc.T = T;
++                finish(d.latent, ng_max, HD, HD, fc, s);
++                if (!wp.par && !replicate((*A.ckv), sr.h_ckv + (size_t) r0 * ckv_rb(), sr.ev_ckv, fc.pdst, ckv_rb(),
+                                           (size_t) g_first * ckv_rb(),
+                                           (size_t) ng * ckv_rb(), l.dev, err))
+                     return false;
+                 if (wp.par && wp.nrow == 0 && mi == 0 && sr.remote) {   // the new rows for the other groups' readers
++                    // (8CC) the sources' g_first row offsets come from the plan buffer on the device, so the hand-off's
++                    // pointers are stable (capture-ready): gather the new ckv and index-key rows into d.rep_stage.
+                     Xfer x;
+-                    x.src[0] = fc.pdst;
++                    x.src[0] = d.rep_stage;
+                     x.dst[0] = sr.x_stage;
+                     x.bytes[0] = (size_t) ng * ckv_rb();
+                     x.n = 1;
++                    if (ng > 0)
++                        rep_gather(d.rep_stage, fc.pdst, d.ng_dev + 1, ckv_rb(), (size_t) ng * ckv_rb(), s);
+                     if (l.owns_k && (*A.ik)[(size_t) l.dev] != nullptr) {
+-                        x.src[1] = (*A.ik)[(size_t) l.dev] + (size_t) g_first * ik_rb();
++                        x.src[1] = d.rep_stage + (size_t) kWin * ckv_rb();
+                         x.dst[1] = sr.x_stage + x_cap() * ckv_rb();
+                         x.bytes[1] = (size_t) ng * ik_rb();
+                         x.n = 2;
++                        if (ng > 0)
++                            rep_gather(d.rep_stage + (size_t) kWin * ckv_rb(), (*A.ik)[(size_t) l.dev], d.ng_dev + 1,
++                                       ik_rb(), (size_t) ng * ik_rb(), s);
+                     }
+                     xfer_put(x, sr.x_flag, wp.win, d.xcnt, s);
+                 }
+@@ -21418,7 +21816,7 @@ struct Model::Impl {
+         // the window rows: the ring's (positions p0 - win ..) then this window's, each query its own 128.  A DSpark
+         // block's ring holds the trunk's main KV (positions <= p0 - 1, seeded); its block of drafts attends to all of
+         // that ring and to the whole block, and leaves the ring as it was
+-        ring_to_ext(A.win, d.ext, l.mtp ? (int64_t) g.win : p0, g.win, HD, s);   // (a block's ring: its rows as they lie)
++        ring_to_ext(A.win, d.ext, l.mtp ? (int64_t) g.win : p0, g.win, HD, s, l.mtp ? nullptr : d.pos_dev);   // (a block's ring: its rows as they lie)
+         Finish fk;
+         fk.w = l.kv_norm;
+         fk.eps = g.eps;
+@@ -21429,7 +21827,9 @@ struct Model::Impl {
+         fk.dst = d.ext + (size_t) g.win * HD;
+         fk.dst_stride = HD;
+         finish(kvr, T, HD, HD, fk, s);
+-        if (!l.mtp) ext_to_ring(d.ext, A.win, p0, g.win, T, HD, s, spec_win ? l.ring_bak + (size_t) r0 * win_rb() : nullptr);
++        if (!l.mtp)
++            ext_to_ring(d.ext, A.win, p0, g.win, T, HD, s, spec_win ? l.ring_bak + (size_t) r0 * win_rb() : nullptr,
++                        !spec_win && undo_h() > 0 ? l.undo_ring : nullptr, undo_h(), d.pos_dev);
+         AttnRows ar;
+         for (int t = 0; t < T; ++t) {
+             if (l.mtp) {
+@@ -21446,6 +21846,13 @@ struct Model::Impl {
+         const void* ckv = nullptr;
+         int ckv_fmt = kKvFp4;
+         if (!attn_sel(l, mi, d, p0, T, r0, wp, A, err, snap, ar.nsel, ckv)) return false;
++        static const bool index_direct_gather = [] {
++            const char* v = std::getenv("DS4_INDEX_DIRECT_GATHER");
++            return v != nullptr && std::atoi(v) != 0;
++        }();
++        if (index_direct_gather && std::getenv("DS4_INDEX_ALL_FAST") != nullptr && T == 1 && l.ix_src &&
++            !l.cand_src && l.ratio > 0 && (p0 + 1) / l.ratio <= g.ix_topk)
++            ar.direct = 1;
+         if (l.mtp) {   // the block's rows (BF16), after the ring's in ext, as every query's selection
+             ckv = d.ext + (size_t) g.win * HD;
+             ckv_fmt = kKvBf16;
+@@ -21479,10 +21886,13 @@ struct Model::Impl {
+         const float* freqs = l.ratio ? d.freqs_comp : d.freqs_win;
+         RingRuns rr;
+         rr.runs = mp.nrun;
++        rr.log_h = undo_h();
+         for (int k = 0; k < mp.nrun; ++k) {
+             const MaRun& u = mp.run[k];
+             rr.ring[k] = attn_seq(L0, mi, u.seq).win;
+             rr.bak[k] = spec_win ? l.ring_bak + (size_t) u.r0 * win_rb() : nullptr;
++            // (the undo log tracks the bound conversation's ring only; the parked ones rewind via a slot, not a log)
++            rr.log[k] = !spec_win && u.seq == sq_bound && undo_h() > 0 ? l.undo_ring : nullptr;
+             rr.p0[k] = l.mtp ? (long long) g.win : (long long) u.p0;   // (a block's ring: its rows as they lie)
+             rr.e0[k] = u.e0;
+             rr.T[k] = u.n;
+@@ -21925,7 +22335,14 @@ struct Model::Impl {
+                     m2.plan_ptr = LD.plan2;
+                     gg::moe_gate_up(m2, d.x, d.xg, s);
+                 }
+-                if ((lead || lane_m) && !zc_nowait) wait_seq(&resps[slot].seq, sq, s);
++                // (Phase 8AM) STRATA_DS4_NO_LANE_WAIT=1 drops the lead device's per-layer wait on the CPU
++                // lane's response sequence. Experiment: is that wait on the critical path? (it is issued
++                // unconditionally on the GGUF/TP path, where lane_class() is always -1)
++                static const bool no_lane_wait = [] {
++                    const char* v = std::getenv("STRATA_DS4_NO_LANE_WAIT");
++                    return v != nullptr && std::atoi(v) != 0;
++                }();
++                if ((lead || lane_m) && !zc_nowait && !no_lane_wait) wait_seq(&resps[slot].seq, sq, s);
+                 prof_mark(d, 4);
+                 if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
+                 else x3::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
+@@ -22047,7 +22464,7 @@ struct Model::Impl {
+                     return false;
+                 }
+                 ++pr[e];
+-                l.heat[(size_t) e] += 1.0f;
++                l.heat[(size_t) e] += heat_scored() ? h_w[t * kPicks + i] * (float) l.k_exp : 1.0f;
+                 if (l.slot[(size_t) e] < 0) l.cpu_hits.push_back(e);
+                 if (held_out(l, e)) ++st.lend_picks;   // (its slot under a prompt's kept room)
+                 per[(size_t) e].push_back({t, i});
+@@ -22404,6 +22821,7 @@ struct Model::Impl {
+             lp_pick(lg, m + 1, tk, r.p0 + 1, &q.toks);
+         }
+         rollback_run(i, m + 1);
++
+         bool ok = true;
+         if (g.n_mtp > 0) {
+             seq_point(r.seq, true);
+@@ -22423,9 +22841,38 @@ struct Model::Impl {
+     }
+ 
+     // rollback() for a multi step's verify window (parked: its conversation's state in sqs): its first `keep` rows kept
++    // undo_commit_single for a multi step's verify window (run i in mruns): the run's sequence's undo buffers, its
++    // window's own ring backups (r.r0 in) and raw rows, and the compressor's snapshot run i.
++    void undo_commit_run(int i, int keep) {
++        const MRun& r = mruns[(size_t) i];
++        const SeqState& q = sqs[(size_t) r.seq];
++        const int uh = undo_h();
++        std::vector<UndoCommitBatch> cb(devs.size());
++        for (int il = 0; il < g.nl; ++il)
++            for (int mi = 0; mi < L[(size_t) il].nm; ++mi) {
++                Layer& l = member(L[(size_t) il], mi);
++                const size_t k = (size_t) sq_base[(size_t) il] + (size_t) mi;
++                if (q.undo_ring[k] == nullptr && q.undo_kv[k] == nullptr) continue;
++                UndoCommitBatch& b = cb[(size_t) l.dev];
++                b.undo_ring[b.n] = q.undo_ring[k];
++                b.ring_bak[b.n] = l.ring_bak + (size_t) r.r0 * win_rb();
++                b.undo_kv[b.n] = q.undo_kv[k];
++                b.undo_sc[b.n] = q.undo_sc[k];
++                b.snap[b.n] = l.c_snap ? l.c_snap + (size_t) i * 2 * (size_t) l.ratio * g.hd : nullptr;
++                b.kv_rows[b.n] = l.c_rows ? l.c_rows + (size_t) r.r0 * g.hd : nullptr;
++                b.sc_rows[b.n] = l.c_rows ? l.c_rows + (size_t) r.r0 * g.hd + (size_t) kWin * g.hd : nullptr;
++                b.ratio[b.n++] = l.ratio;
++            }
++        for (size_t di = 0; di < devs.size(); ++di)
++            if (cb[di].n > 0) {
++                cudaSetDevice(devs[di].id);
++                undo_commit_batch(cb[di], r.p0, keep, uh, g.hd, devs[di].st);
++            }
++    }
+     void rollback_run(int i, int keep) {
+         const MRun& r = mruns[(size_t) i];
+         SeqState& q = sqs[(size_t) r.seq];
++        if (undo_h() > 0 && keep > 0) undo_commit_run(i, keep);   // log the accepted spec rows for restore()
+         if (keep < r.n) {
+             std::vector<RingBatch> rb(devs.size());
+             std::vector<CompBatch> cb(devs.size());
+diff --git a/src/ds4/ds4_model.hpp b/src/ds4/ds4_model.hpp
+index 15866fc..4c23530 100644
+--- a/src/ds4/ds4_model.hpp
++++ b/src/ds4/ds4_model.hpp
+@@ -148,6 +148,11 @@ struct Stats {
+     int64_t ahead_cold = 0, ahead_cold_hit = 0, ahead_pf = 0;
+     int64_t ahead_rank_n[16] = {}, ahead_rank_hit[16] = {};   // the next-layer guesses by rank, and how many were picked
+     int64_t drafts_offered = 0, drafts_accepted = 0, drafts_rounds = 0;
++    // DS4_UNDO_LOG (Phase 8BL-8BN): restores that rewound from the log (hits), the tokens they reused (the kept
++    // prefix = the limit), the tokens the log rewound (pos - limit), and restores the log declined (misses).
++    // Cumulative since engine start; the serve's Monitor boxes read them off the STAT line and split slot reuse = total
++    // reused - undo_reused.
++    int64_t undo_hits = 0, undo_reused = 0, undo_rewound = 0, undo_misses = 0;
+     // per draft position (the 1st .. 8th of a round): verified with all the drafts before it accepted, and accepted
+     int64_t draft_reached[8] = {}, draft_kept[8] = {};
+     double draft_ms = 0.0, verify_ms = 0.0;   // the drafter's time, the verification windows' time
+diff --git a/src/ds4/ds4_undo_log.hpp b/src/ds4/ds4_undo_log.hpp
+new file mode 100644
+index 0000000..344cd76
+--- /dev/null
++++ b/src/ds4/ds4_undo_log.hpp
+@@ -0,0 +1,64 @@
++// src/ds4/ds4_undo_log.hpp - maya-ds4's undo log (DS4_UNDO_LOG, Phase 8BL): the contract the device kernels and
++// Impl::restore() implement.  A restore point is a read stop (8BJ); an undo log snapshots without stopping the read:
++// each write into a circular buffer (the window ring, the compressor's partial group) first records the overwritten
++// slot's old value, so restore() can rewind to any position within the horizon H of the end instead of copying a full
++// Check.  Pure logic, no GPU (tests/ds4_undo_log_test.cpp): slot contents are opaque values (a ring's row bytes, a
++// compressor's raw row), positions are token indices.  The real code mirrors this exactly with win = g.win (ring) or
++// ratio (compressor), H = DS4_UNDO_LOG (0: off), and batched launches for the rewind loop.
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++namespace strata::ds4 {
++
++// A circular undo log over one buffer of `win` slots, horizon H tokens (0: off).  write(p, v) is the buffer's write at
++// token p; it records the overwritten slot's old value into log[p mod H], then stores v.  rewind(limit, pos) undoes the
++// writes limit .. pos-1 in reverse, restoring the exact buffer state as it was after token limit-1 (before token limit).
++// The invariant restore() relies on: rewind is exact iff every undone write's record is still in the log, i.e.
++// covered(limit, pos) (pos - limit <= H); the engine falls back to a full Check when it is not.
++template <class V>
++struct UndoLog {
++    int win = 0;               // the buffer's slots (g.win for the ring, ratio for the compressor)
++    int H = 0;                 // the horizon in tokens (0: off, no record kept)
++    std::vector<V> slot;       // the live buffer (win values)
++    std::vector<V> log;        // H overwritten values, index (p mod H); empty when H == 0
++
++    UndoLog(int win_, int H_) : win(win_), H(H_), slot((size_t) std::max(win_, 0)),
++                               log(H_ > 0 ? (size_t) H_ : 0) {}
++
++    bool on() const { return H > 0; }
++    bool covered(int64_t limit, int64_t pos) const {
++        return on() && limit >= 0 && pos >= limit && pos - limit <= (int64_t) H;
++    }
++
++    // the write at token p (the overwritten slot's old value recorded first)
++    void write(int64_t p, V v) {
++        const size_t s = (size_t) ((p % win + win) % win);
++        if (on()) log[(size_t) ((p % H + H) % H)] = slot[s];
++        slot[s] = v;
++    }
++    // undo the single write at token p (must be undone in reverse, highest p first)
++    void undo(int64_t p) {
++        const size_t s = (size_t) ((p % win + win) % win);
++        slot[s] = log[(size_t) ((p % H + H) % H)];
++    }
++    // rewind the writes limit .. pos-1 (reverse order); requires covered(limit, pos)
++    void rewind(int64_t limit, int64_t pos) {
++        for (int64_t p = pos - 1; p >= limit; --p) undo(p);
++    }
++    // The device kernels' formulation (ring_undo_batch / comp_undo_batch): undoing in reverse leaves each slot holding
++    // the earliest undone write's overwritten value - i.e. slot s's final value is log[p_min % H], p_min the smallest
++    // position in [limit, pos-1] with p_min % win == s (none: the slot is untouched).  Equivalent to rewind(); the test
++    // pins the equivalence.
++    void rewind_direct(int64_t limit, int64_t pos) {
++        for (int s = 0; s < win; ++s) {
++            const int64_t pmin = limit + ((s - limit) % win + win) % win;
++            if (pmin > pos - 1) continue;
++            slot[(size_t) s] = log[(size_t) ((pmin % H + H) % H)];
++        }
++    }
++};
++
++}  // namespace strata::ds4
+diff --git a/src/kernels/cpu/iq_avx2.cpp b/src/kernels/cpu/iq_avx2.cpp
+index 7196747..2a441e5 100644
+--- a/src/kernels/cpu/iq_avx2.cpp
++++ b/src/kernels/cpu/iq_avx2.cpp
+@@ -475,6 +475,9 @@ inline void row_dot_iq1m(const uint8_t* row, int nblocks, const block_q8_K* cons
+         const float dx = h2f(dh);
+         __m256i acc16[NT], del16[NT];
+         for (int t = 0; t < NT; ++t) acc16[t] = del16[t] = _mm256_setzero_si256();
++#if defined(__GNUC__) || defined(__clang__)
++#pragma GCC unroll 4
++#endif
+         for (int j = 0; j < 4; ++j) {
+             const uint8_t* qs = block + 8 * j;
+             const uint8_t* qh = block + 32 + 4 * j;
+diff --git a/tests/ds4_undo_log_test.cpp b/tests/ds4_undo_log_test.cpp
+new file mode 100644
+index 0000000..e18065c
+--- /dev/null
++++ b/tests/ds4_undo_log_test.cpp
+@@ -0,0 +1,171 @@
++// maya-ds4's undo log (src/ds4/ds4_undo_log.hpp): the replay contract Impl::restore() will implement.  No GPU, no
++// model: the window ring (win slots) and the compressor's partial group (ratio slots) are buffers of opaque values,
++// written one token at a time; the undo log records the overwritten slot so a rewind reconstructs the state at an
++// earlier position exactly - the thing the token-equivalence gate (§5 of MAYA-PHASE8BL) turns into 64 identical ids.
++// Proves: (1) rewind is exact at arbitrary positions, group-aligned or not (the "8-token group" is a replay batch, not
++// a correctness limit); (2) the horizon bound: covered() is exactly pos - limit <= H; (3) H=0 keeps writes bit-identical
++// (no log, same slots).
++#ifdef NDEBUG
++#undef NDEBUG
++#endif
++#include "../src/ds4/ds4_undo_log.hpp"
++
++#include <cassert>
++#include <cstdint>
++#include <cstdio>
++#include <vector>
++
++using strata::ds4::UndoLog;
++
++namespace {
++
++// a content value that is a function of the position (the "row" written at token p).  kEmpty is 0 because the real
++// ring and compressor are zeroed before the first token (reset() memsets them), so an unwritten slot's value is 0 - and
++// content(p) = p + 1 never collides with it (a real row's bytes need not be non-zero; the log stores the actual bytes,
++// which is why there is no sentinel ambiguity in the engine).
++using V = int64_t;
++constexpr V kEmpty = 0;
++V content(int64_t p) { return p + 1; }
++
++// the state at a position: the ring (win slots) and the compressor (ratio slots), each slot the content of the latest
++// token that wrote it (0: none yet).  The compressor's fold output (the pooled latent / ckv rows) is indexed by
++// position, not captured here - exactly what Check/restore capture today (the partial group only).
++struct State {
++    UndoLog<V> ring, comp;
++    int64_t pos = 0;
++
++    State(int win, int ratio, int H) : ring(win, H), comp(ratio, H) {}
++
++    void write(int64_t p) { ring.write(p, content(p)); comp.write(p, content(p)); pos = p + 1; }
++
++    bool rewind(int64_t limit) {
++        if (!ring.covered(limit, pos) || !comp.covered(limit, pos)) return false;
++        ring.rewind(limit, pos);
++        comp.rewind(limit, pos);
++        pos = limit;
++        return true;
++    }
++
++    // the exact slot content after tokens 0 .. pos-1, in closed form (the truth model, independent of the log): the
++    // latest token p < pos with p % win == s, i.e. p = pos-1 - ((pos-1-s) mod win), if >= 0.
++    V slot_truth(const UndoLog<V>& b, int s) const {
++        if (pos <= 0) return kEmpty;
++        const int64_t d = ((pos - 1 - s) % b.win + b.win) % b.win;
++        const int64_t p = pos - 1 - d;
++        return p >= 0 ? content(p) : kEmpty;
++    }
++    bool matches_truth() const {
++        for (int s = 0; s < ring.win; ++s)
++            if (ring.slot[(size_t) s] != slot_truth(ring, s)) return false;
++        for (int s = 0; s < comp.win; ++s)
++            if (comp.slot[(size_t) s] != slot_truth(comp, s)) return false;
++        return true;
++    }
++};
++
++void check(int win, int ratio, int H, int64_t P) {
++    State st(win, ratio, H);
++    for (int64_t p = 0; p < P; ++p) st.write(p);
++    assert(st.matches_truth());
++
++    // rewind to every position the horizon covers, and a few it does not
++    for (int64_t limit = 0; limit <= P; ++limit) {
++        State re = st;
++        const bool ok = re.rewind(limit);
++        const bool expect = H > 0 && P - limit <= H;
++        assert(ok == expect);
++        if (expect) {
++            assert(re.pos == limit);
++            assert(re.matches_truth());
++            // the device kernels' direct (one block a slot) formulation must equal the sequential reference
++            State rd = st;
++            rd.ring.rewind_direct(limit, P);
++            rd.comp.rewind_direct(limit, P);
++            assert(rd.ring.slot == re.ring.slot);
++            assert(rd.comp.slot == re.comp.slot);
++        }
++    }
++    // a couple of positions well past the horizon (must refuse, never silently approximate)
++    if (H > 0) {
++        State re = st;
++        assert(!re.rewind(P - H - 1));
++        assert(re.pos == P && re.matches_truth());   // untouched on refusal
++    }
++}
++
++}  // namespace
++
++// Append and rewind interleaved, the way an edit-and-resubmit session actually drives the cache: write at pos, or
++// jump back within the horizon and continue from there.  After every operation the slots must equal the closed-form
++// truth, and the device formulation (rewind_direct) must equal the sequential one.  This is deliberately not a single
++// forward pass - it exercises repeated rewinds without an intervening re-read, the case the engine's slot/undo tiers
++// hit when a client edits twice in a row.
++void check_random(int win, int ratio, int H, int steps, uint32_t seed) {
++    State st(win, ratio, H);
++    uint32_t x = seed;
++    auto rnd = [&]() { x = x * 1664525u + 1013904223u; return x; };
++    for (int i = 0; i < steps; ++i) {
++        const uint32_t r = rnd();
++        if ((r % 100u) < 55u || st.pos <= 0) {
++            st.write(st.pos);                          // prefill / decode: append at pos
++        } else if (H > 0) {
++            const int64_t span = st.pos < H ? st.pos : H;
++            const int64_t limit = st.pos - (int64_t) (rnd() % (uint32_t) (span + 1));
++            if (st.pos - limit <= H) {
++                State re = st;
++                assert(re.rewind(limit));
++                assert(re.pos == limit && re.matches_truth());
++                State rd = st;
++                rd.ring.rewind_direct(limit, st.pos);
++                rd.comp.rewind_direct(limit, st.pos);
++                assert(rd.ring.slot == re.ring.slot && rd.comp.slot == re.comp.slot);
++                st = re;                                // continue from the rewound state
++            }
++        }
++        assert(st.matches_truth());
++    }
++}
++
++// A write the log did not record (a missed hook) restores the WRONG slot with no error at all - the silent fault
++// DS4_UNDO_VERIFY catches on the device.  The proof here: the all-logged log and the one-miss log differ, and the
++// rewind reports nothing.
++void missed_hook_fails() {
++    const int win = 4, H = 8;
++    auto build = [](bool miss) {
++        UndoLog<V> b(win, H);
++        for (int64_t p = 0; p < 8; ++p) {
++            if (miss && p == 5) {
++                b.slot[(size_t) (p % win)] = content(p);   // the write happened; the log entry did not
++                continue;
++            }
++            b.write(p, content(p));
++        }
++        return b;
++    };
++    UndoLog<V> good = build(false), missed = build(true);
++    good.rewind(2, 8);                                 // limit 2: slot 1's p_min is 5, whose entry the miss skipped
++    missed.rewind(2, 8);                               // returns void: no error, no signal
++    assert(good.slot[1] == content(1));                // correct: the value before token 5
++    assert(missed.slot[1] == kEmpty);                  // silently wrong - exactly what the device verify flags
++    assert(good.slot[1] != missed.slot[1]);
++}
++
++int main() {
++    // (win, ratio, H, P): a 1 M context with a 4096 window, ratio-8 compressor, horizons 0 / 1024 / 2048 / 4096
++    check(4096, 8, 0, 5000);
++    check(4096, 8, 1024, 5000);
++    check(4096, 8, 2048, 5000);
++    check(4096, 8, 4096, 23425);   // the 23 K handoff conversation, H = 4096
++    check(512, 16, 4096, 2000);    // a smaller window, ratio 16 (a 16-token group)
++    check(8, 8, 128, 300);         // win == ratio: rewind across many wraps
++
++    // randomized append/rewind interleaving, against the truth model (several seeds, a small and a large window)
++    for (uint32_t seed : {1u, 7u, 1234u, 99991u}) check_random(64, 8, 256, 4000, seed);
++    for (uint32_t seed : {3u, 271828u}) check_random(512, 16, 4096, 4000, seed);
++
++    // the silent-failure mode the device-side DS4_UNDO_VERIFY exists to catch
++    missed_hook_fails();
++
++    std::printf("ds4_undo_log_test: ok\n");
++    return 0;
++}
