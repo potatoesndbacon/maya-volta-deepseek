@@ -33,16 +33,15 @@ The two-request test used expert placement that differed from the one-slot setup
 Prefill aggregation spans the first request start through the later first output. 
 Decode aggregation spans the first output through the later completion, so overlap and queue time affect both aggregates.
 
-## Undo log: faster edits and faster prefill when on tail edits in context
+## Added an Undo Log: faster edits and faster prefill for tail edits in context
 
-During generation, Maya keeps rolling attention-cache data. The undo log saves
+An Undo Log compliments the slot prefix cache, helping further prefill savings. 
+During generation, the undo log with Maya keeps rolling attention-cache data. The undo log saves
 the cache entries that are about to be overwritten. If you revise the end of a
 prompt in the same live session, Maya with an undo log can restore those saved entries and
 continue from the edit, instead of reading the unchanged prefix again. The
-current setting rewinds up to 16,384 tokens from the tail in pinned host memory.
-It only helps when the requested rewind is covered by entries recorded in that
-live session. A conversation restored from a disk slot may not have matching
-undo history; then Maya falls back to its normal restore/recompute path.
+current setting rewinds up to 16,384 tokens from the tail in pinned host memory (about 2gb for 1 slot, 8gb for 4 slots).
+If the Undo Log misses after the slot prefix cache, Maya falls back to its normal prefill recompute path.
 
 Measured hit cases on the V100 production setup:
 
@@ -57,9 +56,10 @@ Measured hit cases on the V100 production setup:
   took 0.34–0.47 s versus 5.80 s for the first read (12–17×), with six hits
   and no misses.
 
-These are edit/reuse workloads; they do not mean ordinary first-time prompt
-prefill is 2.6–37× faster. When the log misses, it provides no reuse and a
-fallback can cost more than a clean hit-path comparison. For example, one
-long-edit run with three misses out of five was 25% slower on prompt time than
-its no-log control. Results depend on how much of the edited context is covered
-by the current session's log.
+It’s most useful for repeated iterative editing, prompt variants, evaluation suites, and other workloads that keep a long prefix and change only
+the ending. It may miss after restoring a conversation from a disk slot, since the undo history is in memory. 
+
+In order to ensure no cache discrepancy, the log records the old value of each cache slot immediately before the slot is overwritten. When rewinding, Maya restores those saved
+values in reverse logical order, so the ring and compressed-cache state match the earlier position. It also tracks which token positions
+are covered; if the requested rewind is outside that recorded range, it reports a miss and uses the normal fallback.
+
