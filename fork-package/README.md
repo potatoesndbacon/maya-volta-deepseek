@@ -36,8 +36,8 @@ follows. Each arm used the same model pack, stock DSpark, TP4, and up to 400
 generated tokens; the production build was measured before and after the fork
 build to expose run-to-run drift.
 
-| Prompt | Production before | Fork build | Production after |
-|---|---:|---:|---:|
+| Prompt | Production before | Fork build |
+|---|---:|---:|
 | Code | 96.3 tok/s | 98.3 tok/s | 
 | Prose | 67.5 tok/s | 66.9 tok/s | 
 | Workflow | 83.2 tok/s | 84.0 tok/s | 
