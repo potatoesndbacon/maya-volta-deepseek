@@ -1,9 +1,9 @@
 {
   "upstream_commit": "8b0a449c599fbb370a1dcc0979ae7c84d4310529",
-  "patch_sha256": "df082cee089618d5106c5f939789915168bca2dbdd0236de9a1f14c80dbde012",
+  "patch_sha256": "69304909b2eaaaeb4a038de5a9b8ae13e50afd6dabff788ae221115ae2beadea",
   "patch_applied_to_clean_upstream": true,
   "changed_files_checked": 16,
-  "production_binary_sha256": "71ef5c38c2f05548a38644d1aa83aac2e9c061a489e4d77972bf6f98fda2af61",
+  "production_binary_sha256": "2b93332d9ceeff5f1d471a69ac55675d5dd9894701f3853b12762cc5d6a05fc7",
   "binary_rebuild_performed": false,
   "diff_check": "The production tree keeps one trailing space in src/ds4/ds4_main.cpp; the package now carries it byte for byte so the fork matches the production commit exactly.",
   "clean_build": {
@@ -19,9 +19,9 @@
     ]
   },
   "refreshed": "2026-11-24",
-  "production_source_commit": "7215099bc749ecd2a8a487b56d28e157bb86d736",
+  "production_source_commit": "09fbffd96feda3233eee158bbcf08599c0e401c7",
   "production_source_branch": "maya-volta-deepseek-1.1.60-prod (worktree /home/oui/maya-v1.1.60-port)",
   "fork_tree_matches_production_commit": 16,
-  "production_binary_built": "2026-11-25 from production commit 7215099 (vectorized undo commit + split drafter)",
+  "production_binary_built": "2026-11-22 12:50 from the production source tree (no source file newer than the binary)",
   "production_source_commit_short": "7215099"
 }

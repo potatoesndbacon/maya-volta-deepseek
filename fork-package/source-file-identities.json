@@ -10,8 +10,8 @@
     "match": true
   },
   "serve/server.py": {
-    "fork_sha256": "85281dbbbe08a574fe02679f7975d8951701287a28fd619022cf258519a0e5ef",
-    "production_commit_sha256": "85281dbbbe08a574fe02679f7975d8951701287a28fd619022cf258519a0e5ef",
+    "fork_sha256": "2c98b3540300ff25f925670ea472678323221dafcad236b0b01b62799ad2d5ff",
+    "production_commit_sha256": "2c98b3540300ff25f925670ea472678323221dafcad236b0b01b62799ad2d5ff",
     "match": true
   },
   "serve/web/monitor.js": {
@@ -45,18 +45,18 @@
     "match": true
   },
   "src/ds4/ds4_main.cpp": {
-    "fork_sha256": "d442458ad8b41d28443895ce59ee3b833dd2151abc7272f38105ec5a2dcf1d2c",
-    "production_commit_sha256": "d442458ad8b41d28443895ce59ee3b833dd2151abc7272f38105ec5a2dcf1d2c",
+    "fork_sha256": "72f492203bbc75717168924fc2834f139c96dcbc3967254e2765cd3fa8733ae1",
+    "production_commit_sha256": "72f492203bbc75717168924fc2834f139c96dcbc3967254e2765cd3fa8733ae1",
     "match": true
   },
   "src/ds4/ds4_model.cu": {
-    "fork_sha256": "3e2b841cacbb4f87b861f82f5e5b3cf2d82c0b8261e6b4c3be0b0c1e4ff3418f",
-    "production_commit_sha256": "3e2b841cacbb4f87b861f82f5e5b3cf2d82c0b8261e6b4c3be0b0c1e4ff3418f",
+    "fork_sha256": "3d7ab812bb1cd697d8e36f571bb391e1076f5372b6ab38068276ab2e85c885c0",
+    "production_commit_sha256": "3d7ab812bb1cd697d8e36f571bb391e1076f5372b6ab38068276ab2e85c885c0",
     "match": true
   },
   "src/ds4/ds4_model.hpp": {
-    "fork_sha256": "e10b7fc7d0577cf64f8f2fccf802650f75b44095ba750d12d63b02e5aac33318",
-    "production_commit_sha256": "e10b7fc7d0577cf64f8f2fccf802650f75b44095ba750d12d63b02e5aac33318",
+    "fork_sha256": "8498af872f3f908cbb1637c896518e3e4f6b24f3cabd786138f9a9b168014742",
+    "production_commit_sha256": "8498af872f3f908cbb1637c896518e3e4f6b24f3cabd786138f9a9b168014742",
     "match": true
   },
   "src/ds4/ds4_os.hpp": {

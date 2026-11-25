@@ -6,43 +6,43 @@ Mechanical inventory of DS4, STRATA and MAYA names appearing in added or removed
 
 Configured: not set under the listed spelling(s)..
 
-- added in [src/ds4/ds4_model.cu:7201](../src/ds4/ds4_model.cu#L7201), [src/ds4/ds4_model.cu:7203](../src/ds4/ds4_model.cu#L7203)
+- added in [src/ds4/ds4_model.cu:7207](../src/ds4/ds4_model.cu#L7207), [src/ds4/ds4_model.cu:7209](../src/ds4/ds4_model.cu#L7209)
 
 ## `DS4_DRAFT_GPU`
 
 Configured: not set under the listed spelling(s)..
 
-- added in [src/ds4/ds4_model.cu:7202](../src/ds4/ds4_model.cu#L7202), [src/ds4/ds4_model.cu:7203](../src/ds4/ds4_model.cu#L7203)
+- added in [src/ds4/ds4_model.cu:7208](../src/ds4/ds4_model.cu#L7208), [src/ds4/ds4_model.cu:7209](../src/ds4/ds4_model.cu#L7209)
 
 ## `DS4_DRAFT_TP`
 
 Configured: not set under the listed spelling(s)..
 
-- added in [src/ds4/ds4_model.cu:1715](../src/ds4/ds4_model.cu#L1715)
+- added in [src/ds4/ds4_model.cu:1721](../src/ds4/ds4_model.cu#L1721)
 
 ## `DS4_INDEX_ALL_FAST`
 
 Configured: `DS4_INDEX_ALL_FAST=1`.
 
-- added in [src/ds4/ds4_model.cu:21706](../src/ds4/ds4_model.cu#L21706), [src/ds4/ds4_model.cu:21928](../src/ds4/ds4_model.cu#L21928)
+- added in [src/ds4/ds4_model.cu:21752](../src/ds4/ds4_model.cu#L21752), [src/ds4/ds4_model.cu:21974](../src/ds4/ds4_model.cu#L21974)
 
 ## `DS4_INDEX_CAND_ALL_FAST`
 
 Configured: not set under the listed spelling(s)..
 
-- added in [src/ds4/ds4_model.cu:21716](../src/ds4/ds4_model.cu#L21716)
+- added in [src/ds4/ds4_model.cu:21762](../src/ds4/ds4_model.cu#L21762)
 
 ## `DS4_INDEX_DIRECT_GATHER`
 
 Configured: not set under the listed spelling(s)..
 
-- added in [src/ds4/ds4_model.cu:21925](../src/ds4/ds4_model.cu#L21925)
+- added in [src/ds4/ds4_model.cu:21971](../src/ds4/ds4_model.cu#L21971)
 
 ## `DS4_INDEX_QUERY_SKIP`
 
 Configured: not set under the listed spelling(s)..
 
-- added in [src/ds4/ds4_model.cu:21710](../src/ds4/ds4_model.cu#L21710)
+- added in [src/ds4/ds4_model.cu:21756](../src/ds4/ds4_model.cu#L21756)
 
 ## `DS4_PACKED_ATTN`
 
@@ -54,14 +54,20 @@ Configured: not set under the listed spelling(s)..
 
 Configured: not set under the listed spelling(s)..
 
-- added in [src/ds4/ds4_model.cu:1417](../src/ds4/ds4_model.cu#L1417), [src/ds4/ds4_model.cu:3790](../src/ds4/ds4_model.cu#L3790), [src/ds4/ds4_model.cu:3792](../src/ds4/ds4_model.cu#L3792), [src/ds4/ds4_model.cu:21483](../src/ds4/ds4_model.cu#L21483), [src/ds4/ds4_model.cu:21494](../src/ds4/ds4_model.cu#L21494), [src/ds4/ds4_model.cu:21537](../src/ds4/ds4_model.cu#L21537)
+- added in [src/ds4/ds4_model.cu:1423](../src/ds4/ds4_model.cu#L1423), [src/ds4/ds4_model.cu:3796](../src/ds4/ds4_model.cu#L3796), [src/ds4/ds4_model.cu:3798](../src/ds4/ds4_model.cu#L3798), [src/ds4/ds4_model.cu:21529](../src/ds4/ds4_model.cu#L21529), [src/ds4/ds4_model.cu:21540](../src/ds4/ds4_model.cu#L21540), [src/ds4/ds4_model.cu:21583](../src/ds4/ds4_model.cu#L21583)
 
 ## `DS4_PLACE_UNIFORM`
 
 Configured: not set under the listed spelling(s)..
 
-- added in [src/ds4/ds4_model.cu:7616](../src/ds4/ds4_model.cu#L7616)
-- removed in [src/ds4/ds4_model.cu:7598](../src/ds4/ds4_model.cu#L7598)
+- added in [src/ds4/ds4_model.cu:7622](../src/ds4/ds4_model.cu#L7622)
+- removed in [src/ds4/ds4_model.cu:7604](../src/ds4/ds4_model.cu#L7604)
+
+## `DS4_SPEC_RELAX`
+
+Configured: not set under the listed spelling(s)..
+
+- added in [src/ds4/ds4_main.cpp:305](../src/ds4/ds4_main.cpp#L305), [src/ds4/ds4_main.cpp:309](../src/ds4/ds4_main.cpp#L309), [src/ds4/ds4_main.cpp:313](../src/ds4/ds4_main.cpp#L313)
 
 ## `DS4_TRACE_DECODE`
 
@@ -85,37 +91,37 @@ Configured: not set under the listed spelling(s)..
 
 Configured: not set under the listed spelling(s)..
 
-- added in [src/ds4/ds4_main.cpp:1185](../src/ds4/ds4_main.cpp#L1185), [src/ds4/ds4_main.cpp:1557](../src/ds4/ds4_main.cpp#L1557), [src/ds4/ds4_main.cpp:1560](../src/ds4/ds4_main.cpp#L1560), [src/ds4/ds4_main.cpp:1561](../src/ds4/ds4_main.cpp#L1561)
+- added in [src/ds4/ds4_main.cpp:1204](../src/ds4/ds4_main.cpp#L1204), [src/ds4/ds4_main.cpp:1576](../src/ds4/ds4_main.cpp#L1576), [src/ds4/ds4_main.cpp:1579](../src/ds4/ds4_main.cpp#L1579), [src/ds4/ds4_main.cpp:1580](../src/ds4/ds4_main.cpp#L1580)
 
 ## `DS4_UNDO_HOST`
 
 Configured: `DS4_UNDO_HOST=1`.
 
-- added in [src/ds4/ds4_kernels.cu:4875](../src/ds4/ds4_kernels.cu#L4875), [src/ds4/ds4_model.cu:9924](../src/ds4/ds4_model.cu#L9924), [src/ds4/ds4_model.cu:9929](../src/ds4/ds4_model.cu#L9929)
+- added in [src/ds4/ds4_kernels.cu:4875](../src/ds4/ds4_kernels.cu#L4875), [src/ds4/ds4_model.cu:9930](../src/ds4/ds4_model.cu#L9930), [src/ds4/ds4_model.cu:9935](../src/ds4/ds4_model.cu#L9935)
 
 ## `DS4_UNDO_LOG`
 
 Configured: `DS4_UNDO_LOG=8192`.
 
-- added in [CMakeLists.txt:263](../CMakeLists.txt#L263), [serve/server.py:3330](../serve/server.py#L3330), [serve/server.py:6562](../serve/server.py#L6562), [serve/web/monitor.js:212](../serve/web/monitor.js#L212), [serve/web/monitor.js:231](../serve/web/monitor.js#L231), [src/ds4/ds4_kernels.cu:997](../src/ds4/ds4_kernels.cu#L997), [src/ds4/ds4_kernels.cu:2511](../src/ds4/ds4_kernels.cu#L2511), [src/ds4/ds4_kernels.cu:4801](../src/ds4/ds4_kernels.cu#L4801), [src/ds4/ds4_kernels.cuh:347](../src/ds4/ds4_kernels.cuh#L347), [src/ds4/ds4_kernels.cuh:367](../src/ds4/ds4_kernels.cuh#L367), [src/ds4/ds4_main.cpp:1470](../src/ds4/ds4_main.cpp#L1470), [src/ds4/ds4_model.cu:965](../src/ds4/ds4_model.cu#L965) (+10 more)
+- added in [CMakeLists.txt:263](../CMakeLists.txt#L263), [serve/server.py:3330](../serve/server.py#L3330), [serve/server.py:6562](../serve/server.py#L6562), [serve/web/monitor.js:212](../serve/web/monitor.js#L212), [serve/web/monitor.js:231](../serve/web/monitor.js#L231), [src/ds4/ds4_kernels.cu:997](../src/ds4/ds4_kernels.cu#L997), [src/ds4/ds4_kernels.cu:2511](../src/ds4/ds4_kernels.cu#L2511), [src/ds4/ds4_kernels.cu:4801](../src/ds4/ds4_kernels.cu#L4801), [src/ds4/ds4_kernels.cuh:347](../src/ds4/ds4_kernels.cuh#L347), [src/ds4/ds4_kernels.cuh:367](../src/ds4/ds4_kernels.cuh#L367), [src/ds4/ds4_main.cpp:1489](../src/ds4/ds4_main.cpp#L1489), [src/ds4/ds4_model.cu:965](../src/ds4/ds4_model.cu#L965) (+10 more)
 
 ## `DS4_UNDO_VERIFY`
 
 Configured: not set under the listed spelling(s)..
 
-- added in [src/ds4/ds4_model.cu:9934](../src/ds4/ds4_model.cu#L9934), [src/ds4/ds4_model.cu:9939](../src/ds4/ds4_model.cu#L9939), [src/ds4/ds4_model.cu:10045](../src/ds4/ds4_model.cu#L10045), [tests/ds4_undo_log_test.cpp:130](../tests/ds4_undo_log_test.cpp#L130), [tests/ds4_undo_log_test.cpp:166](../tests/ds4_undo_log_test.cpp#L166)
+- added in [src/ds4/ds4_model.cu:9940](../src/ds4/ds4_model.cu#L9940), [src/ds4/ds4_model.cu:9945](../src/ds4/ds4_model.cu#L9945), [src/ds4/ds4_model.cu:10051](../src/ds4/ds4_model.cu#L10051), [tests/ds4_undo_log_test.cpp:130](../tests/ds4_undo_log_test.cpp#L130), [tests/ds4_undo_log_test.cpp:166](../tests/ds4_undo_log_test.cpp#L166)
 
 ## `MAYA_DS4_DRAFT_DEV`
 
 Configured: not set under the listed spelling(s)..
 
-- added in [src/ds4/ds4_model.cu:7201](../src/ds4/ds4_model.cu#L7201)
+- added in [src/ds4/ds4_model.cu:7207](../src/ds4/ds4_model.cu#L7207)
 
 ## `MAYA_DS4_DRAFT_TP`
 
 Configured: `MAYA_DS4_DRAFT_TP=1`.
 
-- added in [src/ds4/ds4_model.cu:1711](../src/ds4/ds4_model.cu#L1711), [src/ds4/ds4_model.cu:7126](../src/ds4/ds4_model.cu#L7126), [src/ds4/ds4_model.cu:7203](../src/ds4/ds4_model.cu#L7203), [src/ds4/ds4_model.cu:7206](../src/ds4/ds4_model.cu#L7206), [src/ds4/ds4_model.cu:7599](../src/ds4/ds4_model.cu#L7599), [src/ds4/ds4_model.cu:7604](../src/ds4/ds4_model.cu#L7604), [src/ds4/ds4_model.cu:7612](../src/ds4/ds4_model.cu#L7612), [src/ds4/ds4_model.cu:7768](../src/ds4/ds4_model.cu#L7768), [src/ds4/ds4_model.cu:7770](../src/ds4/ds4_model.cu#L7770), [src/ds4/ds4_model.cu:16989](../src/ds4/ds4_model.cu#L16989), [src/ds4/ds4_model.cu:17091](../src/ds4/ds4_model.cu#L17091), [src/ds4/ds4_model.cu:17367](../src/ds4/ds4_model.cu#L17367)
+- added in [src/ds4/ds4_model.cu:1717](../src/ds4/ds4_model.cu#L1717), [src/ds4/ds4_model.cu:7132](../src/ds4/ds4_model.cu#L7132), [src/ds4/ds4_model.cu:7209](../src/ds4/ds4_model.cu#L7209), [src/ds4/ds4_model.cu:7212](../src/ds4/ds4_model.cu#L7212), [src/ds4/ds4_model.cu:7605](../src/ds4/ds4_model.cu#L7605), [src/ds4/ds4_model.cu:7610](../src/ds4/ds4_model.cu#L7610), [src/ds4/ds4_model.cu:7618](../src/ds4/ds4_model.cu#L7618), [src/ds4/ds4_model.cu:7774](../src/ds4/ds4_model.cu#L7774), [src/ds4/ds4_model.cu:7776](../src/ds4/ds4_model.cu#L7776), [src/ds4/ds4_model.cu:16995](../src/ds4/ds4_model.cu#L16995), [src/ds4/ds4_model.cu:17097](../src/ds4/ds4_model.cu#L17097), [src/ds4/ds4_model.cu:17373](../src/ds4/ds4_model.cu#L17373)
 
 ## `MAYA_DS4_RESIDENT_SKIP_W`
 
@@ -128,6 +134,12 @@ Configured: `STRATA_DS4_RESIDENT_SKIP_W=0`.
 Configured: `STRATA_DS4_RESIDENT_TOPK=0`.
 
 - removed in [src/ds4/ds4_kernels.cu:3863](../src/ds4/ds4_kernels.cu#L3863), [src/ds4/ds4_kernels.cu:3880](../src/ds4/ds4_kernels.cu#L3880)
+
+## `MAYA_DS4_SPEC_RELAX`
+
+Configured: `MAYA_DS4_SPEC_RELAX=0.7`.
+
+- added in [src/ds4/ds4_main.cpp:305](../src/ds4/ds4_main.cpp#L305)
 
 ## `MAYA_DS4_THP`
 
@@ -145,7 +157,7 @@ Configured: not set under the listed spelling(s)..
 
 Configured: not set under the listed spelling(s)..
 
-- added in [src/ds4/ds4_main.cpp:41](../src/ds4/ds4_main.cpp#L41), [src/ds4/ds4_main.cpp:43](../src/ds4/ds4_main.cpp#L43), [src/ds4/ds4_main.cpp:2539](../src/ds4/ds4_main.cpp#L2539), [src/ds4/ds4_main.cpp:2557](../src/ds4/ds4_main.cpp#L2557), [src/ds4/ds4_main.cpp:2574](../src/ds4/ds4_main.cpp#L2574), [src/ds4/ds4_main.cpp:2604](../src/ds4/ds4_main.cpp#L2604)
+- added in [src/ds4/ds4_main.cpp:41](../src/ds4/ds4_main.cpp#L41), [src/ds4/ds4_main.cpp:43](../src/ds4/ds4_main.cpp#L43), [src/ds4/ds4_main.cpp:2560](../src/ds4/ds4_main.cpp#L2560), [src/ds4/ds4_main.cpp:2578](../src/ds4/ds4_main.cpp#L2578), [src/ds4/ds4_main.cpp:2595](../src/ds4/ds4_main.cpp#L2595), [src/ds4/ds4_main.cpp:2625](../src/ds4/ds4_main.cpp#L2625)
 
 ## `MAYA_LOOP_TOOL_BLOCK_ANY`
 
@@ -163,7 +175,7 @@ Configured: `MAYA_LOOP_TOOL_REPS_ANY=4`.
 
 Configured: not set under the listed spelling(s)..
 
-- added in [src/ds4/ds4_main.cpp:2540](../src/ds4/ds4_main.cpp#L2540), [src/ds4/ds4_main.cpp:2575](../src/ds4/ds4_main.cpp#L2575)
+- added in [src/ds4/ds4_main.cpp:2561](../src/ds4/ds4_main.cpp#L2561), [src/ds4/ds4_main.cpp:2596](../src/ds4/ds4_main.cpp#L2596)
 
 ## `STRATA_DS4_AR_BLOCKS`
 
@@ -175,7 +187,7 @@ Configured: `STRATA_DS4_AR_BLOCKS=8`.
 
 Configured: not set under the listed spelling(s)..
 
-- added in [src/ds4/ds4_model.cu:1800](../src/ds4/ds4_model.cu#L1800), [src/ds4/ds4_model.cu:1806](../src/ds4/ds4_model.cu#L1806)
+- added in [src/ds4/ds4_model.cu:1806](../src/ds4/ds4_model.cu#L1806), [src/ds4/ds4_model.cu:1812](../src/ds4/ds4_model.cu#L1812)
 
 ## `STRATA_DS4_COMBINE_THREADS`
 
@@ -187,13 +199,13 @@ Configured: not set under the listed spelling(s)..
 
 Configured: not set under the listed spelling(s)..
 
-- added in [src/ds4/ds4_model.cu:22413](../src/ds4/ds4_model.cu#L22413), [src/ds4/ds4_model.cu:22417](../src/ds4/ds4_model.cu#L22417)
+- added in [src/ds4/ds4_model.cu:22459](../src/ds4/ds4_model.cu#L22459), [src/ds4/ds4_model.cu:22463](../src/ds4/ds4_model.cu#L22463)
 
 ## `STRATA_DS4_PROF`
 
 Configured: not set under the listed spelling(s)..
 
-- added in [src/ds4/ds4_model.cu:17892](../src/ds4/ds4_model.cu#L17892), [src/ds4/ds4_model.cu:17897](../src/ds4/ds4_model.cu#L17897)
+- added in [src/ds4/ds4_model.cu:17938](../src/ds4/ds4_model.cu#L17938), [src/ds4/ds4_model.cu:17943](../src/ds4/ds4_model.cu#L17943)
 
 ## `STRATA_DS4_RESIDENT_ABS`
 

@@ -4,7 +4,7 @@
   "environment_file": "/home/oui/maya-unsloth-iq2xxs.env",
   "config": "/home/oui/maya-v1.1.53-release/maya-ds4-v1-1m-unsloth.json",
   "engine": "/home/oui/maya-v1.1.60-build/maya-ds4",
-  "engine_sha256": "71ef5c38c2f05548a38644d1aa83aac2e9c061a489e4d77972bf6f98fda2af61",
+  "engine_sha256": "2b93332d9ceeff5f1d471a69ac55675d5dd9894701f3853b12762cc5d6a05fc7",
   "args": [
     "--pack",
     "/home/oui/models/Huihui-DeepSeek-V4.1-Flash-1017-abliterated-IQ2_XXS/UD-IQ2_XXS/maya-ds4-d1",
@@ -61,6 +61,7 @@
     "MAYA_DS4_ROUTE_FUSE": "2",
     "MAYA_DS4_SLOT_KEEP": "1",
     "MAYA_DS4_SLOT_RAM_GB": "8",
+    "MAYA_DS4_SPEC_RELAX": "0.7",
     "MAYA_DS4_THP": "0",
     "MAYA_DS4_VISION_RESIDENT": "1",
     "MAYA_LOOP_TOOL_BLOCK_ANY": "6",

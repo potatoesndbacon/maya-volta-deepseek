@@ -18,6 +18,7 @@ new implementation in this patch.
 | `DS4_UNDO_VERIFY` | Read back and verify touched rewind slots; default off, diagnostic. | unset |
 | `DS4_UNDO_FIRST` | Prototype in-place rewind before parking conversation slots; default off. | unset |
 | `MAYA_DS4_DRAFT_TP` | (2026-11-25) `1`: DSpark blocks tensor parallel over the four GPUs; off: whole blocks (spread over GPUs 1–3 by default). Engine draft timer −27/−28 % a round vs spread; end to end within noise. | `1` |
+| `MAYA_DS4_SPEC_RELAX` | (2026-11-25) **LOSSY** MARS-style relaxed verification at temperature > 0: a draft the exact rule rejects is kept when it is the target's top-1, or its top-2 with p2/p1 ≥ θ. Unset/0: the exact rule. Per request: `strata_tune {"spec_relax": θ}` (0 opts out). Paired in-process A/B +5.4 % [3.2, 7.8] (prose +4.3 %); quality suite at T=1 within spread. | `0.7` |
 | `MAYA_DS4_UNDO_VEC` | (2026-11-25) undo commit in 16-byte units; default on, `0`: the byte loop. Exact. | unset (on) |
 | `MAYA_DS4_THP` | (2026-11-22) `0`/unset: `MADV_NOHUGEPAGE` on anonymous RAM-tier mappings; `1`: huge pages as upstream. | `0` (config env and unit drop-in `thp.conf`) |
 | `DS4_INDEX_ALL_FAST` | For eligible single-token, unrestricted indexer rows, select all when all positions fit top-k. Default off. | `1` |

@@ -217,6 +217,12 @@ public:
     /// without, no device work.  force >= 0: the caller writes that token in place of the pick's last one (the thinking
     /// budget's end), and that row reports it.
     void set_logprobs(int k, int force = -1);
+    /// MARS-style relaxed verification (lossy, opt-in per request: GEN spec_relax=<theta>, 0 < theta <= 1; 0 or less:
+    /// off, the exact rule).  At temperature > 0, the first draft the exact rule rejects is kept anyway when it is the
+    /// target's top-1, or its top-2 with p(top-2) / p(top-1) >= theta at the request's temperature (after the penalties);
+    /// the rows after it keep their own exact verdicts.  verify() only (not verify_multi)
+    void set_spec_relax(float theta);
+    long long spec_relaxed() const;   // drafts kept by the relaxation since the load
     const std::vector<LogprobRow>& logprobs() const;
     /// The last feed's logit rows on the host (rows x vocab floats).
     bool logits(std::vector<float>& out);

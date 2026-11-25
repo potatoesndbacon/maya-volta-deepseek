@@ -1,6 +1,6 @@
 # Complete changed source hunk index
 
-Generated 2026-11-24 from the complete patch `8b0a449..7215099`, including the two new files. Hunk locations refer to the official tag and the production source; the patch contains every exact line change.
+Generated 2026-11-24 from the complete patch `8b0a449..09fbffd`, including the two new files. Hunk locations refer to the official tag and the production source; the patch contains every exact line change.
 
 ## `CMakeLists.txt`
 
@@ -15,6 +15,7 @@ Generated 2026-11-24 from the complete patch `8b0a449..7215099`, including the t
 
 ## `serve/server.py`
 
+- `@@ -1216,7 +1216,7 @@ class StrataEngine:`
 - `@@ -3327,7 +3327,18 @@ class Service:`
 - `@@ -6206,6 +6217,9 @@ def make_handler(svc: Service):`
 - `@@ -6522,6 +6536,68 @@ def make_handler(svc: Service):`
@@ -86,14 +87,19 @@ Generated 2026-11-24 from the complete patch `8b0a449..7215099`, including the t
 ## `src/ds4/ds4_main.cpp`
 
 - `@@ -36,6 +36,33 @@`
-- `@@ -1155,6 +1182,24 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c`
-- `@@ -1422,6 +1467,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c`
-- `@@ -1501,18 +1552,32 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c`
-- `@@ -2062,6 +2127,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c`
-- `@@ -2469,6 +2535,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c`
-- `@@ -2483,6 +2553,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c`
-- `@@ -2494,6 +2570,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c`
-- `@@ -2520,6 +2600,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c`
+- `@@ -274,6 +301,22 @@ std::string per_position(const strata::ds4::Stats& s0, const strata::ds4::Stats&`
+- `@@ -494,6 +537,8 @@ struct Req {`
+- `@@ -656,6 +701,7 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {`
+- `@@ -1155,6 +1201,24 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c`
+- `@@ -1422,6 +1486,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c`
+- `@@ -1501,18 +1571,32 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c`
+- `@@ -1859,6 +1943,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c`
+- `@@ -2062,6 +2147,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c`
+- `@@ -2129,6 +2215,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c`
+- `@@ -2469,6 +2556,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c`
+- `@@ -2483,6 +2574,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c`
+- `@@ -2494,6 +2591,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c`
+- `@@ -2520,6 +2621,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c`
 
 ## `src/ds4/ds4_model.cu`
 
@@ -101,63 +107,68 @@ Generated 2026-11-24 from the complete patch `8b0a449..7215099`, including the t
 - `@@ -625,6 +626,10 @@ struct Dev {`
 - `@@ -680,6 +685,9 @@ struct Dev {`
 - `@@ -954,6 +962,12 @@ struct Layer {`
-- `@@ -1400,6 +1414,7 @@ struct Model::Impl {`
-- `@@ -1521,6 +1536,10 @@ struct Model::Impl {`
-- `@@ -1545,12 +1564,15 @@ struct Model::Impl {`
-- `@@ -1686,6 +1708,11 @@ struct Model::Impl {`
-- `@@ -1770,6 +1797,17 @@ struct Model::Impl {`
-- `@@ -3749,6 +3787,10 @@ struct Model::Impl {`
-- `@@ -4135,7 +4177,7 @@ struct Model::Impl {`
-- `@@ -4345,8 +4387,10 @@ struct Model::Impl {`
-- `@@ -6847,6 +6891,18 @@ struct Model::Impl {`
-- `@@ -7065,8 +7121,11 @@ struct Model::Impl {`
-- `@@ -7138,6 +7197,15 @@ struct Model::Impl {`
-- `@@ -7527,7 +7595,25 @@ struct Model::Impl {`
-- `@@ -7676,6 +7762,14 @@ struct Model::Impl {`
-- `@@ -9626,6 +9720,9 @@ struct Model::Impl {`
-- `@@ -9636,6 +9733,9 @@ struct Model::Impl {`
-- `@@ -9643,6 +9743,17 @@ struct Model::Impl {`
-- `@@ -9684,6 +9795,7 @@ struct Model::Impl {`
-- `@@ -9696,6 +9808,8 @@ struct Model::Impl {`
-- `@@ -9716,6 +9830,9 @@ struct Model::Impl {`
-- `@@ -9729,7 +9846,7 @@ struct Model::Impl {`
-- `@@ -9741,6 +9858,7 @@ struct Model::Impl {`
-- `@@ -9794,6 +9912,35 @@ struct Model::Impl {`
-- `@@ -9831,6 +9978,10 @@ struct Model::Impl {`
-- `@@ -9865,7 +10016,167 @@ struct Model::Impl {`
-- `@@ -9886,6 +10197,9 @@ struct Model::Impl {`
-- `@@ -10270,6 +10584,7 @@ struct Model::Impl {`
-- `@@ -15245,7 +15560,7 @@ struct Model::Impl {`
-- `@@ -16670,8 +16985,9 @@ struct Model::Impl {`
-- `@@ -16772,7 +17088,38 @@ struct Model::Impl {`
-- `@@ -17017,7 +17364,7 @@ struct Model::Impl {`
-- `@@ -17467,6 +17814,7 @@ struct Model::Impl {`
-- `@@ -17481,6 +17829,7 @@ struct Model::Impl {`
-- `@@ -17540,6 +17889,25 @@ struct Model::Impl {`
-- `@@ -17878,7 +18246,7 @@ struct Model::Impl {`
-- `@@ -17908,7 +18276,8 @@ struct Model::Impl {`
-- `@@ -21085,6 +21454,11 @@ struct Model::Impl {`
-- `@@ -21102,7 +21476,26 @@ struct Model::Impl {`
-- `@@ -21135,7 +21528,20 @@ struct Model::Impl {`
-- `@@ -21147,13 +21553,17 @@ struct Model::Impl {`
-- `@@ -21216,6 +21626,13 @@ struct Model::Impl {`
-- `@@ -21265,7 +21682,11 @@ struct Model::Impl {`
-- `@@ -21277,8 +21698,34 @@ struct Model::Impl {`
-- `@@ -21287,17 +21734,25 @@ struct Model::Impl {`
-- `@@ -21313,7 +21768,12 @@ struct Model::Impl {`
-- `@@ -21367,31 +21827,44 @@ struct Model::Impl {`
-- `@@ -21418,7 +21891,7 @@ struct Model::Impl {`
-- `@@ -21429,7 +21902,9 @@ struct Model::Impl {`
-- `@@ -21446,6 +21921,13 @@ struct Model::Impl {`
-- `@@ -21479,10 +21961,13 @@ struct Model::Impl {`
-- `@@ -21925,7 +22410,14 @@ struct Model::Impl {`
-- `@@ -22047,7 +22539,7 @@ struct Model::Impl {`
-- `@@ -22404,6 +22896,7 @@ struct Model::Impl {`
-- `@@ -22423,9 +22916,38 @@ struct Model::Impl {`
+- `@@ -1310,6 +1324,12 @@ struct Model::Impl {`
+- `@@ -1400,6 +1420,7 @@ struct Model::Impl {`
+- `@@ -1521,6 +1542,10 @@ struct Model::Impl {`
+- `@@ -1545,12 +1570,15 @@ struct Model::Impl {`
+- `@@ -1686,6 +1714,11 @@ struct Model::Impl {`
+- `@@ -1770,6 +1803,17 @@ struct Model::Impl {`
+- `@@ -3749,6 +3793,10 @@ struct Model::Impl {`
+- `@@ -4135,7 +4183,7 @@ struct Model::Impl {`
+- `@@ -4345,8 +4393,10 @@ struct Model::Impl {`
+- `@@ -6847,6 +6897,18 @@ struct Model::Impl {`
+- `@@ -7065,8 +7127,11 @@ struct Model::Impl {`
+- `@@ -7138,6 +7203,15 @@ struct Model::Impl {`
+- `@@ -7527,7 +7601,25 @@ struct Model::Impl {`
+- `@@ -7676,6 +7768,14 @@ struct Model::Impl {`
+- `@@ -9626,6 +9726,9 @@ struct Model::Impl {`
+- `@@ -9636,6 +9739,9 @@ struct Model::Impl {`
+- `@@ -9643,6 +9749,17 @@ struct Model::Impl {`
+- `@@ -9684,6 +9801,7 @@ struct Model::Impl {`
+- `@@ -9696,6 +9814,8 @@ struct Model::Impl {`
+- `@@ -9716,6 +9836,9 @@ struct Model::Impl {`
+- `@@ -9729,7 +9852,7 @@ struct Model::Impl {`
+- `@@ -9741,6 +9864,7 @@ struct Model::Impl {`
+- `@@ -9794,6 +9918,35 @@ struct Model::Impl {`
+- `@@ -9831,6 +9984,10 @@ struct Model::Impl {`
+- `@@ -9865,7 +10022,167 @@ struct Model::Impl {`
+- `@@ -9886,6 +10203,9 @@ struct Model::Impl {`
+- `@@ -10270,6 +10590,7 @@ struct Model::Impl {`
+- `@@ -15245,7 +15566,7 @@ struct Model::Impl {`
+- `@@ -16670,8 +16991,9 @@ struct Model::Impl {`
+- `@@ -16772,7 +17094,38 @@ struct Model::Impl {`
+- `@@ -17017,7 +17370,7 @@ struct Model::Impl {`
+- `@@ -17273,6 +17626,30 @@ struct Model::Impl {`
+- `@@ -17456,6 +17833,22 @@ struct Model::Impl {`
+- `@@ -17467,6 +17860,7 @@ struct Model::Impl {`
+- `@@ -17481,6 +17875,7 @@ struct Model::Impl {`
+- `@@ -17540,6 +17935,25 @@ struct Model::Impl {`
+- `@@ -17878,7 +18292,7 @@ struct Model::Impl {`
+- `@@ -17908,7 +18322,8 @@ struct Model::Impl {`
+- `@@ -21085,6 +21500,11 @@ struct Model::Impl {`
+- `@@ -21102,7 +21522,26 @@ struct Model::Impl {`
+- `@@ -21135,7 +21574,20 @@ struct Model::Impl {`
+- `@@ -21147,13 +21599,17 @@ struct Model::Impl {`
+- `@@ -21216,6 +21672,13 @@ struct Model::Impl {`
+- `@@ -21265,7 +21728,11 @@ struct Model::Impl {`
+- `@@ -21277,8 +21744,34 @@ struct Model::Impl {`
+- `@@ -21287,17 +21780,25 @@ struct Model::Impl {`
+- `@@ -21313,7 +21814,12 @@ struct Model::Impl {`
+- `@@ -21367,31 +21873,44 @@ struct Model::Impl {`
+- `@@ -21418,7 +21937,7 @@ struct Model::Impl {`
+- `@@ -21429,7 +21948,9 @@ struct Model::Impl {`
+- `@@ -21446,6 +21967,13 @@ struct Model::Impl {`
+- `@@ -21479,10 +22007,13 @@ struct Model::Impl {`
+- `@@ -21925,7 +22456,14 @@ struct Model::Impl {`
+- `@@ -22047,7 +22585,7 @@ struct Model::Impl {`
+- `@@ -22404,6 +22942,7 @@ struct Model::Impl {`
+- `@@ -22423,9 +22962,38 @@ struct Model::Impl {`
+- `@@ -22838,6 +23406,8 @@ void Model::set_penalties(int last_n, float repeat, float freq, float present) {`
 
 ## `src/ds4/ds4_model.hpp`
 
 - `@@ -148,6 +148,11 @@ struct Stats {`
+- `@@ -212,6 +217,12 @@ public:`
 
 ## `src/ds4/ds4_os.hpp`
 

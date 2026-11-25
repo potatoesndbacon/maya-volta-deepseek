@@ -1324,6 +1324,12 @@ struct Model::Impl {
     // drafts a round either way); DS4_DSPARK_QTEMP=f: those draws at f x the request's temperature (any q keeps the
     // rule exact); DS4_DSPARK_MAX=n: at most n drafts a round; DS4_DSPARK_DUMP=file: the drafter's inputs and outputs
     // (tools/ds4/dspark_ref.py checks them against DeepSeek's checkpoint)
+    // (Model::set_spec_relax) MARS-style relaxed verification: theta (0: off) and the top-2 rows' buffers
+    float relax = 0.0f;
+    long long relaxed_n = 0;
+    LogprobRow* h_rx = nullptr;
+    LogprobRow* d_rx = nullptr;
+    int32_t* d_rx_ids = nullptr;
     bool sample_drafts = std::getenv("DS4_DSPARK_SAMPLE") != nullptr && std::atoi(std::getenv("DS4_DSPARK_SAMPLE")) != 0;
     float q_temp_scale = std::getenv("DS4_DSPARK_QTEMP") ? (float) std::atof(std::getenv("DS4_DSPARK_QTEMP")) : 1.0f;
     int max_drafts = std::getenv("DS4_DSPARK_MAX") ? std::atoi(std::getenv("DS4_DSPARK_MAX")) : 0;
@@ -17620,6 +17626,30 @@ struct Model::Impl {
         std::fprintf(stderr, "ds4 sample: %s\n", cudaGetErrorString(e));
         return -1;
     }
+    // (spec_relax) each verify row's top-2 after the request's penalties, at temperature 1, into h_rx [n]
+    bool relax_rows(int n, const std::vector<int>& drafts, int64_t end0) {
+        Dev& d = devs[(size_t) head_dev];
+        cudaSetDevice(d.id);
+        if (d_rx_ids == nullptr) {
+            std::string e;
+            if (!((h_rx != nullptr || halloc(h_rx, kWin, e)) && (d_rx != nullptr || dalloc(d, d_rx, kWin, e)) &&
+                  dalloc(d, d_rx_ids, kWin, e))) {
+                std::fprintf(stderr, "ds4: spec_relax's rows: %s - the exact rule only\n", e.c_str());
+                relax = 0.0f;
+                return false;
+            }
+        }
+        int ids[kWin];
+        for (int i = 0; i < n; ++i) ids[i] = drafts[(size_t) i];
+        cudaMemcpyAsync(d_rx_ids, ids, (size_t) n * sizeof(int32_t), cudaMemcpyHostToDevice, d.st);
+        strata::kernels::SamplerParams sp;
+        int h = 0;
+        const int* hr = pen_rows(end0, n, sp, h);
+        logprob_rows(d.logits, g.vocab, n, hr, h, sp.penalty_repeat, sp.penalty_freq, sp.penalty_present, d_rx_ids, 2,
+                     d_rx, d.st);
+        cudaMemcpyAsync(h_rx, d_rx, (size_t) n * sizeof(LogprobRow), cudaMemcpyDeviceToHost, d.st);
+        return cudaStreamSynchronize(d.st) == cudaSuccess;
+    }
     // a pick's log-probabilities (lp_k >= 0 only; set_logprobs): its T tokens `ids` (lp_force in place of the last),
     // `rows` the T logit rows they came from on the head device, the penalty windows as the pick's (pen_rows from end0,
     // hist as there) -> lp_rows.  Called after the pick's own wait: its penalty rows and its token copy are done
@@ -17803,6 +17833,22 @@ struct Model::Impl {
             CK(cudaMemcpyAsync(h_idx, d_ints + 16, (size_t) n * 4, cudaMemcpyDeviceToHost, hd.st));
             CK(cudaStreamSynchronize(hd.st));
             while (m < n && h_idx[m] == drafts[(size_t) m]) ++m;
+            if (relax > 0.0f && m < n && relax_rows(n, drafts, p0 + 1)) {
+                // (spec_relax) a rejected draft kept when it is the target's top-1, or its top-2 within theta of it; the
+                // rows past it keep their own exact verdicts (each row's draw is its own, sampler_kernel<2>)
+                while (m < n) {
+                    const int dd = drafts[(size_t) m];
+                    if (h_idx[m] != dd) {
+                        const LogprobRow& r = h_rx[m];
+                        const bool top1 = r.n >= 1 && r.top[0] == dd;
+                        const bool top2 = r.n >= 2 && r.top[1] == dd &&
+                                          std::exp((double) (r.top_lp[1] - r.top_lp[0]) / (double) temperature) >= relax;
+                        if (!top1 && !top2) break;
+                        ++relaxed_n;
+                    }
+                    ++m;
+                }
+            }
             next = m < n ? h_idx[m]
                          : sample_row(n, temperature, top_p, top_k, min_p, seed, counter + (uint64_t) n, cur_bias,
                                       p0 + 1 + n);
@@ -23360,6 +23406,8 @@ void Model::set_penalties(int last_n, float repeat, float freq, float present) {
     p_->pen_present = present;
 }
 void Model::set_logit_bias(const std::vector<std::pair<int, float>>& entries) { p_->set_logit_bias(entries); }
+void Model::set_spec_relax(float theta) { p_->relax = std::isfinite(theta) && theta > 0.0f ? std::min(theta, 1.0f) : 0.0f; }
+long long Model::spec_relaxed() const { return p_->relaxed_n; }
 void Model::set_logprobs(int k, int force) {
     p_->lp_k = k < 0 ? -1 : std::min(k, kTopLogprobs);
     p_->lp_force = k < 0 ? -1 : force;

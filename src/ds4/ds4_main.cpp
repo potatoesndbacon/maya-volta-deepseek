@@ -301,6 +301,22 @@ std::string per_position(const strata::ds4::Stats& s0, const strata::ds4::Stats&
 // drafts are likely lost is not verified whole.  MAYA_DS4_DSPARK_CUM=F, a request's dspark_cum
 // key; 0: off, only the floor on each draft's own confidence (dspark_conf).  0.5 by default: a Radeon 8065S, Maya-S,
 // greedy over code / chat / a list, two runs: decode 12.04 -> 12.82 tok/s (+6.5%), the same tokens
+const char* ds4_env(const char* name);   // (below)
+// MAYA_DS4_SPEC_RELAX=theta (DS4_SPEC_RELAX): MARS-style relaxed verification for every request that does not set its
+// own spec_relax (Model::set_spec_relax; lossy, unset or 0: the exact rule).  Read once, logged once
+float spec_relax_default() {
+    static const float v = [] {
+        const char* e = ds4_env("DS4_SPEC_RELAX");
+        const float x = e != nullptr ? std::strtof(e, nullptr) : 0.0f;
+        const float t = std::isfinite(x) && x > 0.0f ? std::min(x, 1.0f) : 0.0f;
+        if (t > 0.0f)
+            std::fprintf(stderr, "maya-ds4: DS4_SPEC_RELAX=%.3g: a rejected draft kept when it is the target's top-1 or "
+                                 "its top-2 within that ratio of it (lossy; a request's spec_relax=0 keeps the exact rule)\n",
+                         t);
+        return t;
+    }();
+    return v;
+}
 float dspark_cum_default() {
     static const float v = [] {
         const char* e = std::getenv("MAYA_DS4_DSPARK_CUM");
@@ -521,6 +537,8 @@ struct Req {
     int spec = -1;          // spec=0|1: this request drafts or not (-1: as the engine was started)
     float conf = -1.0f;     // dspark_conf=F: the drafts' confidence floor for this request (-1: the engine's)
     float cum = -1.0f;      // dspark_cum=F: the cut on the product of the confidences (-1: the engine's, dspark_cum_default)
+    float relax = -1.0f;    // spec_relax=F: MARS-style relaxed verification for this request (0: the exact rule;
+                            // -1: the engine's, spec_relax_default)
     int lookup = -1;        // suffix_draft=0|1: this request's prompt lookup off / on (-1: as the engine was started)
     // the penalties (penalty_last_n / _repeat / _freq / _present, llama.cpp's): over the last pen_n tokens of the state
     // (-1: the whole context, which the engine caps at its window; 0: none)
@@ -683,6 +701,7 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "dspark_conf") r.conf = std::strtof(v.c_str(), nullptr);
         else if (k == "dspark_cum" || k == "spec_cum") r.cum = std::strtof(v.c_str(), nullptr);
         else if (k == "spec_min_p") r.conf = std::strtof(v.c_str(), nullptr);   // (the server's strata_tune names)
+        else if (k == "spec_relax") r.relax = std::strtof(v.c_str(), nullptr);
         else if (k == "suffix_draft") r.lookup = std::atoi(v.c_str()) != 0;
         else if (k == "penalty_last_n") r.pen_n = std::atoi(v.c_str());
         else if (k == "penalty_repeat") r.pen_repeat = std::strtof(v.c_str(), nullptr);
@@ -1924,6 +1943,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                         std::isfinite(r.pen_repeat) && r.pen_repeat > 0.0f ? r.pen_repeat : 1.0f,
                         std::isfinite(r.pen_freq) ? r.pen_freq : 0.0f, std::isfinite(r.pen_present) ? r.pen_present : 0.0f);
         m.set_logit_bias(r.bias);
+        m.set_spec_relax(r.relax >= 0.0f ? r.relax : spec_relax_default());
         m.set_logprobs(r.logprobs);   // (logprobs=<k>: each token's row, kept as its token is: tok_lp, got_lp)
         int tok = m.sample(r.temperature, r.top_p, r.top_k, r.min_p, r.seed, counter++);
         std::vector<int> got;
@@ -2195,6 +2215,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             a.limit = a.r.max_new > 0 ? a.r.max_new : m.max_context() - (long long) a.r.ids.size();
             a.in_think = a.r.think_budget > 0 && a.r.think_end >= 0;
             penalties(a.r);
+            m.set_spec_relax(a.r.relax >= 0.0f ? a.r.relax : spec_relax_default());
             m.set_logprobs(a.r.logprobs);
             a.tok = m.sample(a.r.temperature, a.r.top_p, a.r.top_k, a.r.min_p, a.r.seed, a.counter++);
             if (a.r.logprobs >= 0) a.tok_lp = lp_take(m, 1).back();
