@@ -1,8 +1,9 @@
 # maya-volta-deepseek
 
 Source changes carried on the official Maya v1.1.60 base for DeepSeek inference
-on NVIDIA Volta (SM70). Refreshed 2026-11-24 to the production commit `c0e574b`
-(engine `3235039e…`, adds the `MAYA_DS4_THP` huge-page opt-out). The branch is `maya-volta-deepseek-1.1.60`. The full
+on NVIDIA Volta (SM70). Refreshed 2026-11-25 to the production commit `7215099`
+(engine `71ef5c38…`: the `MAYA_DS4_THP` huge-page opt-out, the vectorized undo
+commit and the tensor-parallel DSpark drafter, `MAYA_DS4_DRAFT_TP`). The branch is `maya-volta-deepseek-1.1.60`. The full
 source patch is [`production-v1.1.60.patch`](production-v1.1.60.patch), and the
 source-level descriptions are in [`DIFFERENCES.md`](DIFFERENCES.md).
 

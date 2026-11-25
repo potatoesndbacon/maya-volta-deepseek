@@ -4872,10 +4872,62 @@ __global__ void undo_commit_batch_kernel(const UndoCommitBatch b, long long p0_a
         }
     }
 }
+// (2026-11-24) the same copy in 16-byte units.  With DS4_UNDO_HOST the destination is host-mapped memory, so the byte
+// loop above issued one PCIe write per byte: ~300 us a round on each GPU (550 KB at ~1.8 GB/s), first in the stream
+// the drafter's seed waits behind.  Same bytes, same places; taken only when every pointer and size is 16-aligned
+// (ring rows are padded to 16, d floats a multiple of 4), else the byte kernel.  MAYA_DS4_UNDO_VEC=0: the byte kernel.
+__global__ void undo_commit_batch_vec_kernel(const UndoCommitBatch b, long long p0_arg, const int64_t* p0p, int keep, int log_h,
+                                             int d) {
+    const long long p0 = p0p != nullptr ? (long long) *p0p : p0_arg;
+    pdl_wait();
+    pdl_trigger();
+    const int i = blockIdx.x, li = blockIdx.y;
+    if (i >= keep) return;
+    const long long p = p0 + i;
+    if (b.undo_ring[li] != nullptr) {
+        const size_t rb = kv_row_bytes(kKvFp8, d);
+        uint4* dst = (uint4*) (b.undo_ring[li] + (size_t) (p % log_h) * rb);
+        const uint4* src = (const uint4*) (b.ring_bak[li] + (size_t) i * rb);
+        for (size_t x = threadIdx.x; x < rb / 16; x += blockDim.x) dst[x] = src[x];
+    }
+    if (b.undo_kv[li] != nullptr) {
+        const int R = b.ratio[li];
+        const int slot = (int) (p % R);
+        const size_t lr = (size_t) (p % log_h) * (size_t) d;
+        const float* kvsrc = (i < R) ? b.snap[li] + (size_t) slot * d : b.kv_rows[li] + (size_t) (i - R) * d;
+        const float* scsrc =
+            (i < R) ? b.snap[li] + (size_t) R * d + (size_t) slot * d : b.sc_rows[li] + (size_t) (i - R) * d;
+        float4* kd = (float4*) (b.undo_kv[li] + lr);
+        float4* sd = (float4*) (b.undo_sc[li] + lr);
+        for (int e = threadIdx.x; e < d / 4; e += blockDim.x) {
+            kd[e] = ((const float4*) kvsrc)[e];
+            sd[e] = ((const float4*) scsrc)[e];
+        }
+    }
+}
+static bool undo_vec_ok(const UndoCommitBatch& b, int d) {
+    static const bool on = [] {
+        const char* v = std::getenv("MAYA_DS4_UNDO_VEC");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    if (!on || d % 4 != 0 || kv_row_bytes(kKvFp8, d) % 16 != 0) return false;
+    auto a16 = [](const void* q) { return ((uintptr_t) q & 15u) == 0; };
+    for (int li = 0; li < b.n; ++li) {
+        if (!a16(b.undo_ring[li]) || !a16(b.ring_bak[li]) || !a16(b.undo_kv[li]) || !a16(b.undo_sc[li]) ||
+            !a16(b.snap[li]) || !a16(b.kv_rows[li]) || !a16(b.sc_rows[li]))
+            return false;
+        // (snap / rows offsets are slot * d and (i - R) * d floats: 16-aligned when d % 4 == 0)
+    }
+    return true;
+}
 void undo_commit_batch(const UndoCommitBatch& b, int64_t p0, int keep, int log_h, int d, cudaStream_t s, const int64_t* p0p) {
     if (keep <= 0 || b.n <= 0) return;
-    pdl_launch(undo_commit_batch_kernel, dim3((unsigned) keep, (unsigned) b.n), kThreads, 0, s, b, (long long) p0, p0p, keep,
-               log_h, d);
+    if (undo_vec_ok(b, d))
+        pdl_launch(undo_commit_batch_vec_kernel, dim3((unsigned) keep, (unsigned) b.n), kThreads, 0, s, b, (long long) p0, p0p,
+                   keep, log_h, d);
+    else
+        pdl_launch(undo_commit_batch_kernel, dim3((unsigned) keep, (unsigned) b.n), kThreads, 0, s, b, (long long) p0, p0p,
+                   keep, log_h, d);
 }
 void hc_mean(const float* h, int T, int hc, int dim, float* out, long long out_stride, cudaStream_t s) {
     pdl_launch(hc_mean_kernel, dim3(cdiv(dim, kThreads), T), kThreads, 0, s, h, hc, dim, out, out_stride);

@@ -1,6 +1,6 @@
 # Complete changed source hunk index
 
-Generated 2026-11-24 from the complete patch `8b0a449..c0e574b`, including the two new files. Hunk locations refer to the official tag and the production source; the patch contains every exact line change.
+Generated 2026-11-24 from the complete patch `8b0a449..7215099`, including the two new files. Hunk locations refer to the official tag and the production source; the patch contains every exact line change.
 
 ## `CMakeLists.txt`
 
@@ -67,9 +67,9 @@ Generated 2026-11-24 from the complete patch `8b0a449..c0e574b`, including the t
 - `@@ -4068,9 +4164,18 @@ bool copy_regions(const CopyRegions& r, cudaStream_t s) {`
 - `@@ -4591,13 +4696,20 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int`
 - `@@ -4651,8 +4763,8 @@ bool sparse_attn_rows(const float* q, const uint16_t* win, const AttnCkv& c, con`
-- `@@ -4666,24 +4778,104 @@ void ext_to_ring_runs(const RingRuns& r, const uint16_t* ext, int n, int d, cuda`
-- `@@ -4784,7 +4976,58 @@ void set_flag(unsigned* flag, unsigned v, cudaStream_t s) {`
-- `@@ -4801,7 +5044,16 @@ void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned`
+- `@@ -4666,24 +4778,156 @@ void ext_to_ring_runs(const RingRuns& r, const uint16_t* ext, int n, int d, cuda`
+- `@@ -4784,7 +5028,58 @@ void set_flag(unsigned* flag, unsigned v, cudaStream_t s) {`
+- `@@ -4801,7 +5096,16 @@ void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned`
 
 ## `src/ds4/ds4_kernels.cuh`
 
@@ -104,47 +104,56 @@ Generated 2026-11-24 from the complete patch `8b0a449..c0e574b`, including the t
 - `@@ -1400,6 +1414,7 @@ struct Model::Impl {`
 - `@@ -1521,6 +1536,10 @@ struct Model::Impl {`
 - `@@ -1545,12 +1564,15 @@ struct Model::Impl {`
-- `@@ -1770,6 +1792,17 @@ struct Model::Impl {`
-- `@@ -3749,6 +3782,10 @@ struct Model::Impl {`
-- `@@ -4345,8 +4382,10 @@ struct Model::Impl {`
-- `@@ -6847,6 +6886,18 @@ struct Model::Impl {`
-- `@@ -9626,6 +9677,9 @@ struct Model::Impl {`
-- `@@ -9636,6 +9690,9 @@ struct Model::Impl {`
-- `@@ -9643,6 +9700,17 @@ struct Model::Impl {`
-- `@@ -9684,6 +9752,7 @@ struct Model::Impl {`
-- `@@ -9696,6 +9765,8 @@ struct Model::Impl {`
-- `@@ -9716,6 +9787,9 @@ struct Model::Impl {`
-- `@@ -9729,7 +9803,7 @@ struct Model::Impl {`
-- `@@ -9741,6 +9815,7 @@ struct Model::Impl {`
-- `@@ -9794,6 +9869,35 @@ struct Model::Impl {`
-- `@@ -9831,6 +9935,10 @@ struct Model::Impl {`
-- `@@ -9865,7 +9973,167 @@ struct Model::Impl {`
-- `@@ -9886,6 +10154,9 @@ struct Model::Impl {`
-- `@@ -10270,6 +10541,7 @@ struct Model::Impl {`
-- `@@ -15245,7 +15517,7 @@ struct Model::Impl {`
-- `@@ -17467,6 +17739,7 @@ struct Model::Impl {`
-- `@@ -17481,6 +17754,7 @@ struct Model::Impl {`
-- `@@ -17540,6 +17814,25 @@ struct Model::Impl {`
-- `@@ -17878,7 +18171,7 @@ struct Model::Impl {`
-- `@@ -17908,7 +18201,8 @@ struct Model::Impl {`
-- `@@ -21085,6 +21379,11 @@ struct Model::Impl {`
-- `@@ -21102,7 +21401,26 @@ struct Model::Impl {`
-- `@@ -21135,7 +21453,20 @@ struct Model::Impl {`
-- `@@ -21147,13 +21478,17 @@ struct Model::Impl {`
-- `@@ -21216,6 +21551,13 @@ struct Model::Impl {`
-- `@@ -21265,7 +21607,11 @@ struct Model::Impl {`
-- `@@ -21277,8 +21623,34 @@ struct Model::Impl {`
-- `@@ -21287,17 +21659,25 @@ struct Model::Impl {`
-- `@@ -21313,7 +21693,12 @@ struct Model::Impl {`
-- `@@ -21367,31 +21752,44 @@ struct Model::Impl {`
-- `@@ -21418,7 +21816,7 @@ struct Model::Impl {`
-- `@@ -21429,7 +21827,9 @@ struct Model::Impl {`
-- `@@ -21446,6 +21846,13 @@ struct Model::Impl {`
-- `@@ -21479,10 +21886,13 @@ struct Model::Impl {`
-- `@@ -21925,7 +22335,14 @@ struct Model::Impl {`
-- `@@ -22047,7 +22464,7 @@ struct Model::Impl {`
-- `@@ -22404,6 +22821,7 @@ struct Model::Impl {`
-- `@@ -22423,9 +22841,38 @@ struct Model::Impl {`
+- `@@ -1686,6 +1708,11 @@ struct Model::Impl {`
+- `@@ -1770,6 +1797,17 @@ struct Model::Impl {`
+- `@@ -3749,6 +3787,10 @@ struct Model::Impl {`
+- `@@ -4135,7 +4177,7 @@ struct Model::Impl {`
+- `@@ -4345,8 +4387,10 @@ struct Model::Impl {`
+- `@@ -6847,6 +6891,18 @@ struct Model::Impl {`
+- `@@ -7065,8 +7121,11 @@ struct Model::Impl {`
+- `@@ -7138,6 +7197,15 @@ struct Model::Impl {`
+- `@@ -7527,7 +7595,25 @@ struct Model::Impl {`
+- `@@ -7676,6 +7762,14 @@ struct Model::Impl {`
+- `@@ -9626,6 +9720,9 @@ struct Model::Impl {`
+- `@@ -9636,6 +9733,9 @@ struct Model::Impl {`
+- `@@ -9643,6 +9743,17 @@ struct Model::Impl {`
+- `@@ -9684,6 +9795,7 @@ struct Model::Impl {`
+- `@@ -9696,6 +9808,8 @@ struct Model::Impl {`
+- `@@ -9716,6 +9830,9 @@ struct Model::Impl {`
+- `@@ -9729,7 +9846,7 @@ struct Model::Impl {`
+- `@@ -9741,6 +9858,7 @@ struct Model::Impl {`
+- `@@ -9794,6 +9912,35 @@ struct Model::Impl {`
+- `@@ -9831,6 +9978,10 @@ struct Model::Impl {`
+- `@@ -9865,7 +10016,167 @@ struct Model::Impl {`
+- `@@ -9886,6 +10197,9 @@ struct Model::Impl {`
+- `@@ -10270,6 +10584,7 @@ struct Model::Impl {`
+- `@@ -15245,7 +15560,7 @@ struct Model::Impl {`
+- `@@ -16670,8 +16985,9 @@ struct Model::Impl {`
+- `@@ -16772,7 +17088,38 @@ struct Model::Impl {`
+- `@@ -17017,7 +17364,7 @@ struct Model::Impl {`
+- `@@ -17467,6 +17814,7 @@ struct Model::Impl {`
+- `@@ -17481,6 +17829,7 @@ struct Model::Impl {`
+- `@@ -17540,6 +17889,25 @@ struct Model::Impl {`
+- `@@ -17878,7 +18246,7 @@ struct Model::Impl {`
+- `@@ -17908,7 +18276,8 @@ struct Model::Impl {`
+- `@@ -21085,6 +21454,11 @@ struct Model::Impl {`
+- `@@ -21102,7 +21476,26 @@ struct Model::Impl {`
+- `@@ -21135,7 +21528,20 @@ struct Model::Impl {`
+- `@@ -21147,13 +21553,17 @@ struct Model::Impl {`
+- `@@ -21216,6 +21626,13 @@ struct Model::Impl {`
+- `@@ -21265,7 +21682,11 @@ struct Model::Impl {`
+- `@@ -21277,8 +21698,34 @@ struct Model::Impl {`
+- `@@ -21287,17 +21734,25 @@ struct Model::Impl {`
+- `@@ -21313,7 +21768,12 @@ struct Model::Impl {`
+- `@@ -21367,31 +21827,44 @@ struct Model::Impl {`
+- `@@ -21418,7 +21891,7 @@ struct Model::Impl {`
+- `@@ -21429,7 +21902,9 @@ struct Model::Impl {`
+- `@@ -21446,6 +21921,13 @@ struct Model::Impl {`
+- `@@ -21479,10 +21961,13 @@ struct Model::Impl {`
+- `@@ -21925,7 +22410,14 @@ struct Model::Impl {`
+- `@@ -22047,7 +22539,7 @@ struct Model::Impl {`
+- `@@ -22404,6 +22896,7 @@ struct Model::Impl {`
+- `@@ -22423,9 +22916,38 @@ struct Model::Impl {`
 
 ## `src/ds4/ds4_model.hpp`
 

@@ -13,3 +13,12 @@ clean `8b0a449` export (`git apply --check`). The production executable is `3235
 `/home/oui/maya-v1.1.60-build`; no source file in the tree is newer than it. No rebuild of the production binary
 was performed for this refresh. One separate build of the opt-in `bae1086` branch was made in
 `/home/oui/maya-v1.1.60-pmask-build` (2 min 38 s, CMake 3.31.6, same cache options); it is not used by the service.
+
+## Refresh — 2026-11-25
+
+Regenerated from production commit `7215099` (adds `06fd953`, the vectorized undo commit, and the split drafter). All 16
+changed/added files match the commit byte for byte, and the patch applies to a clean `8b0a449` export. The production
+executable `71ef5c38…` was built in `/home/oui/maya-v1.1.60-build` from that tree. Checks run before promotion: undo commit
+with `DS4_UNDO_VERIFY=1` (3 rewinds through speculatively committed rows, 1,180 slots, 0 bad); split drafter probe 391,
+draft acceptance unchanged (80–88 % by position), quality suite 21/24 (twice) against 21/24 for a control. Measurements:
+`/home/oui/MAYA-DECODE-CAPTURE-2026-11-24.md` §6–7.

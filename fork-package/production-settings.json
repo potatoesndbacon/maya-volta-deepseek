@@ -4,7 +4,7 @@
   "environment_file": "/home/oui/maya-unsloth-iq2xxs.env",
   "config": "/home/oui/maya-v1.1.53-release/maya-ds4-v1-1m-unsloth.json",
   "engine": "/home/oui/maya-v1.1.60-build/maya-ds4",
-  "engine_sha256": "3235039e510f1689cac5ebc4616d81542746096c2524123a502bbd8ccc5171c0",
+  "engine_sha256": "71ef5c38c2f05548a38644d1aa83aac2e9c061a489e4d77972bf6f98fda2af61",
   "args": [
     "--pack",
     "/home/oui/models/Huihui-DeepSeek-V4.1-Flash-1017-abliterated-IQ2_XXS/UD-IQ2_XXS/maya-ds4-d1",
@@ -53,6 +53,7 @@
     "DS4_UNDO_LOG": "8192",
     "MAYA_DS4_COPY_SWAP": "0",
     "MAYA_DS4_DECODE_TRIM": "15",
+    "MAYA_DS4_DRAFT_TP": "1",
     "MAYA_DS4_HC_FUSE": "2",
     "MAYA_DS4_LANE_SPIN_US": "0",
     "MAYA_DS4_PROMPT_SKIP": "2",

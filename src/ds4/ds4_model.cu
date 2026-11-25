@@ -1708,6 +1708,11 @@ struct Model::Impl {
     // leaves the host out too - none of it on the CPU lane, and the lead's round trip would delay every member at the
     // next all-reduce.  Off: such a layer through the host as before (the same tokens either way)
     bool host_free_tp = ds4_env("DS4_HOST_FREE_TP") != nullptr && std::atoi(ds4_env("DS4_HOST_FREE_TP")) != 0;
+    // (2026-11-25) MAYA_DS4_DRAFT_TP=1: the DSpark blocks tensor parallel over the drafter's group, as the trunk's
+    // layers - each member its share of the heads, wo_a groups and FFNs (load_dense's split), every drafter expert in
+    // VRAM as member parts, the blocks run by the members' worker threads with the group's all-reduce.  Off: the
+    // blocks whole on one GPU, as before.
+    bool draft_tp = ds4_env("DS4_DRAFT_TP") != nullptr && std::atoi(ds4_env("DS4_DRAFT_TP")) != 0;
     // a window's hc_mix + hc_split on the device's second stream (st2) beside the attention and the MoE - CUDA's: a
     // layer on one GPU each verify round 66.6 vs 68.8 ms on its stream (every layer on one GPU, 9 GPUs, 3.5 bits, the same
     // tokens), a group's beside its all-reduces.  HIP keeps them on the layer's stream: its two cross-stream waits a layer
@@ -4172,7 +4177,7 @@ struct Model::Impl {
             }
             for (Layer& l : L) {
                 l.dev = groups[(size_t) l.grp].mem[0];
-                l.nm = l.mtp ? 1 : (int) groups[(size_t) l.grp].mem.size();   // (the drafter's blocks: whole, on the lead
+                l.nm = l.mtp && !draft_tp ? 1 : (int) groups[(size_t) l.grp].mem.size();   // (the drafter's blocks: whole, on the lead
             }                                                                  //  unless DS4_DRAFT_DEV names their members)
             if (!draft_devs(err)) return false;
             for (size_t i = 0; i < draft_dev.size(); ++i) {
@@ -7116,8 +7121,11 @@ struct Model::Impl {
 
     // (DS4_DRAFT_DEV) whether device di holds a DSpark block
     bool block_dev(int di) const {
-        for (int i = 0; i < g.n_mtp; ++i)
-            if (L[(size_t) (g.nl + i)].dev == di) return true;
+        for (int i = 0; i < g.n_mtp; ++i) {
+            const Layer& b = L[(size_t) (g.nl + i)];
+            for (int m = 0; m < b.nm; ++m)   // (MAYA_DS4_DRAFT_TP: every member of a split block)
+                if (member(b, m).dev == di) return true;
+        }
         return false;
     }
     // the drafter's seeding read h_taps on every block device: a stream about to write the taps waits for each
@@ -7189,6 +7197,15 @@ struct Model::Impl {
     }
     bool draft_devs(std::string& err) {
         draft_dev.clear();
+        if (draft_tp) {   // (the blocks run on every member: no block device to pick)
+            if (std::getenv("MAYA_DS4_DRAFT_DEV") != nullptr || std::getenv("DS4_DRAFT_DEV") != nullptr ||
+                ds4_env("DS4_DRAFT_GPU") != nullptr) {
+                err = "MAYA_DS4_DRAFT_TP=1 runs the DSpark blocks on the drafter's whole group: unset DS4_DRAFT_DEV / DS4_DRAFT_GPU";
+                return false;
+            }
+            std::fprintf(stderr, "ds4: DSpark blocks tensor parallel over the drafter's group (MAYA_DS4_DRAFT_TP=1)\n");
+            return true;
+        }
         const char* v = std::getenv("MAYA_DS4_DRAFT_DEV");
         if (v == nullptr) v = std::getenv("DS4_DRAFT_DEV");
         if (v == nullptr) return draft_spread();
@@ -7578,7 +7595,25 @@ struct Model::Impl {
                 if (l.grp == (int) gi && l.mtp && l.n_cls == 1)
                     for (int e = 0; e < l.n_exp; ++e) dseen = dseen || prof[(size_t) l.il * g.n_exp + e] > 0;
             // (DS4_DRAFT_VRAM: each block's hottest up to its cap, as room goes - the profile's rule below not asked)
-            if (mroom.size() == 1 || !dseen || std::getenv("DS4_PLACE_UNIFORM") != nullptr || !draft_vram.empty()) {
+            if (draft_tp && mroom.size() > 1) {
+                // (MAYA_DS4_DRAFT_TP: every block's experts in VRAM, each member holding its part of every one - charged
+                //  to each member's own room; the CPU lane takes no drafter expert of a split block)
+                for (Layer& l : L)
+                    if (l.grp == (int) gi && l.mtp && l.n_cls == 1) {
+                        if ((size_t) l.nm != mroom.size()) {
+                            err = "MAYA_DS4_DRAFT_TP: DSpark block " + std::to_string(l.il - g.nl) + " is not split over its group";
+                            return false;
+                        }
+                        l.n_vram = l.n_exp;
+                        for (int m = 0; m < l.nm; ++m) mroom[(size_t) m] -= (double) l.n_exp * (double) unit(member(l, m));
+                    }
+                for (size_t m = 0; m < mroom.size(); ++m)
+                    if (mroom[m] < 0) {
+                        err = "MAYA_DS4_DRAFT_TP: the DSpark blocks' expert parts do not fit member " + std::to_string(m) +
+                              " of group " + std::to_string(gi);
+                        return false;
+                    }
+            } else if (mroom.size() == 1 || !dseen || std::getenv("DS4_PLACE_UNIFORM") != nullptr || !draft_vram.empty()) {
                 for (Layer& l : L)   // all of them, as room goes (DS4_DRAFT_VRAM: up to vram_cap)
                     if (l.grp == (int) gi && l.mtp && l.n_cls == 1) {
                         double& r = mroom[bm(l)];
@@ -7727,6 +7762,14 @@ struct Model::Impl {
             //  against its own room from the same snapshot; over it, a slot less in its group's layer with the most
             //  (the drafter's last), one at a time, till every member fits - no slot left to take: the load refused)
             if (tp_uneven && groups[gi].mem.size() > 1 && !trim_to_fit((int) gi, own, err)) return false;
+            if (draft_tp)
+                for (const Layer& l : L)
+                    if (l.grp == (int) gi && l.mtp && l.n_vram < l.n_exp) {
+                        err = "MAYA_DS4_DRAFT_TP: DSpark block " + std::to_string(l.il - g.nl) + " kept " +
+                              std::to_string(l.n_vram) + " of its " + std::to_string(l.n_exp) +
+                              " experts in VRAM; a split block needs them all (free VRAM, or unset MAYA_DS4_DRAFT_TP)";
+                        return false;
+                    }
         }
         if (tp_auto_redo) {   // (#766: the first pass ends here - Model::load makes the load again with the parts)
             err = "tensor parallel: the load is made again with the FFN parts from the members' rooms";
@@ -16942,8 +16985,9 @@ struct Model::Impl {
         // each block device (DS4_DRAFT_DEV: more than one) projects the taps itself - main_proj / main_norm are on every
         // one - then seeds its own blocks' rings, in block order; no row crosses the cards
         std::vector<char> projected(devs.size(), 0);
-        for (int i = 0; i < g.n_mtp; ++i) {
-            Layer& l = L[(size_t) (g.nl + i)];
+        for (int i = 0; i < g.n_mtp; ++i)
+          for (int bm = 0; bm < L[(size_t) (g.nl + i)].nm; ++bm) {   // (MAYA_DS4_DRAFT_TP: each member its own ring)
+            Layer& l = member(L[(size_t) (g.nl + i)], bm);
             Dev& d = devs[(size_t) l.dev];
             cudaSetDevice(d.id);
             if (!projected[(size_t) l.dev]) {
@@ -17044,7 +17088,38 @@ struct Model::Impl {
             return false;
         int cur = d_dev;   // the device the block's rows are on
         std::vector<char> handed(devs.size(), 0);   // (DS4_DECODE_TRIM 8: a device's one block hand-off region)
-        for (int i = 0; i < g.n_mtp; ++i) {
+        // (MAYA_DS4_DRAFT_TP: every member takes the block's rows, then each member's worker thread runs its share of
+        //  every block - the group's all-reduces in them, as run_dev runs the trunk's - and the lead's rows go on below)
+        const bool btp = draft_tp && L[(size_t) g.nl].nm > 1 && dump_d == nullptr && workers.size() == devs.size();
+        if (btp) {
+            const Layer& B0 = L[(size_t) g.nl];
+            for (int m = 1; m < B0.nm; ++m) {
+                Dev& e = devs[(size_t) member(B0, m).dev];
+                cudaSetDevice(e.id);
+                CK(cudaMemcpyAsync(e.emb_rows, h_emb, (size_t) T * D * 2, cudaMemcpyHostToDevice, e.st));
+                embed(e.emb_rows, T, e.h, D, H, e.st);
+                init_pre(e.pre, T, e.st);
+            }
+            std::vector<std::string> errs((size_t) B0.nm);
+            for (int m = 0; m < B0.nm; ++m)
+                workers[(size_t) member(B0, m).dev]->submit([this, m, p0, T, &dp, &errs] {
+                    std::string e;
+                    for (int i = 0; i < g.n_mtp; ++i)
+                        if (!layer(L[(size_t) (g.nl + i)], m, p0, T, dp, e)) {
+                            errs[(size_t) m] = e.empty() ? "a DSpark block's member failed" : e;
+                            return;
+                        }
+                });
+            for (int m = 0; m < B0.nm; ++m) workers[(size_t) member(B0, m).dev]->wait();
+            for (const std::string& e : errs)
+                if (!e.empty()) {
+                    err = e;
+                    return false;
+                }
+            cur = B0.dev;
+            cudaSetDevice(devs[(size_t) cur].id);
+        }
+        for (int i = 0; i < g.n_mtp && !btp; ++i) {
             Layer& l = L[(size_t) (g.nl + i)];
             if (l.dev != cur && (decode_trim & 8) && !handed[(size_t) cur] && devs[(size_t) cur].dhand != nullptr) {
                 // (DS4_DECODE_TRIM 8: h, then pre, through the device's host-mapped rows and its flag - xfer_put on
@@ -17289,7 +17364,7 @@ struct Model::Impl {
     bool can_draft_multi(const int* sv, int n) const {
         const int T = g.d_block;
         if (g.n_mtp == 0 || sqs.empty() || n < 2 || T < 1 || n * T > kWin || n * (T + 1) > kWin + 2 ||
-            dump_d != nullptr || lend_broken)
+            dump_d != nullptr || lend_broken || draft_tp)   // (MAYA_DS4_DRAFT_TP: one conversation a pass, draft_())
             return false;
         for (int c = 0; c < n; ++c) {
             if (sv[c] < 0 || sv[c] >= (int) sqs.size() || seq_pos(sv[c]) + T > o.max_context) return false;

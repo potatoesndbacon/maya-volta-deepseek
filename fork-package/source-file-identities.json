@@ -35,8 +35,8 @@
     "match": true
   },
   "src/ds4/ds4_kernels.cu": {
-    "fork_sha256": "724ddf4db79f3788fb79e56cfc5ef27c03f620d2b3ca56734b50f1ec02ed0289",
-    "production_commit_sha256": "724ddf4db79f3788fb79e56cfc5ef27c03f620d2b3ca56734b50f1ec02ed0289",
+    "fork_sha256": "0d598b238087ac3be4121f02f3e32f741e2b6ab018aaab4f6017b5ee6e252aad",
+    "production_commit_sha256": "0d598b238087ac3be4121f02f3e32f741e2b6ab018aaab4f6017b5ee6e252aad",
     "match": true
   },
   "src/ds4/ds4_kernels.cuh": {
@@ -50,8 +50,8 @@
     "match": true
   },
   "src/ds4/ds4_model.cu": {
-    "fork_sha256": "43708b6ace67d1d6369721b8d472b581bd9a99f8c79e3d0ddfef5a7abdeaf668",
-    "production_commit_sha256": "43708b6ace67d1d6369721b8d472b581bd9a99f8c79e3d0ddfef5a7abdeaf668",
+    "fork_sha256": "3e2b841cacbb4f87b861f82f5e5b3cf2d82c0b8261e6b4c3be0b0c1e4ff3418f",
+    "production_commit_sha256": "3e2b841cacbb4f87b861f82f5e5b3cf2d82c0b8261e6b4c3be0b0c1e4ff3418f",
     "match": true
   },
   "src/ds4/ds4_model.hpp": {

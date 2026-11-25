@@ -17,6 +17,8 @@ new implementation in this patch.
 | `DS4_UNDO_HOST` | Put undo buffers in mapped pinned host memory rather than VRAM; default off. | `1` |
 | `DS4_UNDO_VERIFY` | Read back and verify touched rewind slots; default off, diagnostic. | unset |
 | `DS4_UNDO_FIRST` | Prototype in-place rewind before parking conversation slots; default off. | unset |
+| `MAYA_DS4_DRAFT_TP` | (2026-11-25) `1`: DSpark blocks tensor parallel over the four GPUs; off: whole blocks (spread over GPUs 1–3 by default). Engine draft timer −27/−28 % a round vs spread; end to end within noise. | `1` |
+| `MAYA_DS4_UNDO_VEC` | (2026-11-25) undo commit in 16-byte units; default on, `0`: the byte loop. Exact. | unset (on) |
 | `MAYA_DS4_THP` | (2026-11-22) `0`/unset: `MADV_NOHUGEPAGE` on anonymous RAM-tier mappings; `1`: huge pages as upstream. | `0` (config env and unit drop-in `thp.conf`) |
 | `DS4_INDEX_ALL_FAST` | For eligible single-token, unrestricted indexer rows, select all when all positions fit top-k. Default off. | `1` |
 | `DS4_INDEX_QUERY_SKIP` | Additionally skip query work in the applicable all-selected case; default off. | unset |
@@ -43,7 +45,7 @@ DSpark. These are not automatically local source additions. The complete
 filtered live process snapshot is in `production-settings.json`; it deliberately
 omits unrelated process environment and credentials.
 
-The current executable (`3235039e…`, built 2026-11-22 from production commit `c0e574b`) was built using CUDA 12.8, SM70, Release `-O3`,
+The current executable (`71ef5c38…`, built 2026-11-25 from production commit `7215099`) was built using CUDA 12.8, SM70, Release `-O3`,
 `DS4_CUDA_PEER_AR=1`, and `STRATA_NATIVE_EXPERTS=1`. The configured deployment is
 TP4, one serving slot, the Huihui UD-IQ2_XXS pack with the D1 drafter (`maya-ds4-d1`), 1,048,576 context, prefill chunk 1024, DSpark on/confidence
 0.5, vision on and four V100S at 150 W. These are machine-specific deployment

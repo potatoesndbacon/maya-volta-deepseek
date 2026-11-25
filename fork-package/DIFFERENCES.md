@@ -1,9 +1,9 @@
 # Source differences from Maya v1.1.60
 
 This package carries the production source patch against the official Maya
-v1.1.60 commit `8b0a449c599fbb370a1dcc0979ae7c84d4310529`. Since the 2026-11-24
-refresh it is the exact diff of the production commit `c0e574b` (branch
-`maya-volta-deepseek-1.1.60-prod`), the source of the running engine `3235039e…`. The complete diff is
+v1.1.60 commit `8b0a449c599fbb370a1dcc0979ae7c84d4310529`. Since the 2026-11-25
+refresh it is the exact diff of the production commit `7215099` (branch
+`maya-volta-deepseek-1.1.60-prod`), the source of the running engine `71ef5c38…`. The complete diff is
 [`production-v1.1.60.patch`](production-v1.1.60.patch); its changed hunks are
 indexed in [`HUNK-INDEX.md`](HUNK-INDEX.md). Performance observations for each
 change are summarized in the [README](README.md#changes-and-measured-performance-impact).
@@ -17,10 +17,10 @@ change are summarized in the [README](README.md#changes-and-measured-performance
 | `src/ds4/ds4_gguf.cu` | Adds combine metadata staging and configurable combine launch size. The current call path does not establish use of the staged mask pointer. |
 | `src/ds4/ds4_iq.cu` | Adds an NC=16 full-width quantized GEMV branch and Q6_K read-only loads. |
 | `src/ds4/ds4_iq_cpu.cpp` | Reuses per-thread gate/up layout until row count or worker count changes. |
-| `src/ds4/ds4_kernels.cu` | Adds undo recording/commit/rewind kernels, configurable all-reduce blocks, FP4 unpack read-only loads, resident-expert selection controls, optional attention/indexing paths, device-position and gather groundwork, and profiling instrumentation. |
+| `src/ds4/ds4_kernels.cu` | (2026-11-25) The undo commit copies in 16-byte units when every pointer is aligned (`MAYA_DS4_UNDO_VEC`, default on): with the log in host-mapped memory the byte loop cost 130–300 µs a round. Adds undo recording/commit/rewind kernels, configurable all-reduce blocks, FP4 unpack read-only loads, resident-expert selection controls, optional attention/indexing paths, device-position and gather groundwork, and profiling instrumentation. |
 | `src/ds4/ds4_kernels.cuh` | Extends kernel data structures and declarations for device positions, gathers, undo buffers, batched rewind, and commit. |
 | `src/ds4/ds4_main.cpp` | Adds bounded decode/NVTX capture, undo metrics, and optional undo-first conversation restore. |
-| `src/ds4/ds4_model.cu` | Manages undo state and restore lifecycle; adds indexer shortcuts and optional scored-cache, P2P, packed-attention, device-position, and resident-routing paths. |
+| `src/ds4/ds4_model.cu` | (2026-11-25) `MAYA_DS4_DRAFT_TP=1`: the DSpark blocks tensor parallel over the drafter's group (split at load like trunk layers, every drafter expert in VRAM as member parts, each member's ring seeded, the blocks run on the members' worker threads with the group's all-reduce; batched drafting falls back to per-conversation drafting). Manages undo state and restore lifecycle; adds indexer shortcuts and optional scored-cache, P2P, packed-attention, device-position, and resident-routing paths. |
 | `src/ds4/ds4_os.hpp` | (2026-11-22) `MAYA_DS4_THP`: anonymous RAM-tier mappings get `MADV_NOHUGEPAGE` unless `MAYA_DS4_THP=1`, so loading the expert RAM tier no longer storms kcompactd/khugepaged under `defrag=madvise`. |
 | `src/ds4/ds4_model.hpp` | Exposes undo counters in model statistics. |
 | `src/ds4/ds4_undo_log.hpp` | Defines host-side circular overwrite/rewind index math and the shared undo contract. |
