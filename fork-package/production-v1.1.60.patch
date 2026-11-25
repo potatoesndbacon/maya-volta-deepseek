@@ -2277,6 +2277,23 @@ index 15866fc..4c23530 100644
      // per draft position (the 1st .. 8th of a round): verified with all the drafts before it accepted, and accepted
      int64_t draft_reached[8] = {}, draft_kept[8] = {};
      double draft_ms = 0.0, verify_ms = 0.0;   // the drafter's time, the verification windows' time
+diff --git a/src/ds4/ds4_os.hpp b/src/ds4/ds4_os.hpp
+index ccb2dda..a75b5ec 100644
+--- a/src/ds4/ds4_os.hpp
++++ b/src/ds4/ds4_os.hpp
+@@ -501,7 +501,11 @@ inline void* anon_alloc(size_t bytes, int node, int nodes) {
+ #else
+     void* m = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+     if (m == MAP_FAILED) return nullptr;
+-    madvise(m, bytes, MADV_HUGEPAGE);
++    // MAYA_DS4_THP=0: no huge pages for this mapping.  With /sys/.../defrag=madvise a fault of a MADV_HUGEPAGE
++    // region compacts memory on the spot; a 56 GB RAM tier of experts then storms kcompactd/khugepaged instead of
++    // loading (the GLM tier guards this; see core/glm_fast_path.cu).
++    static const bool no_huge = !(getenv("MAYA_DS4_THP") && std::atoi(getenv("MAYA_DS4_THP")));
++    madvise(m, bytes, no_huge ? MADV_NOHUGEPAGE : MADV_HUGEPAGE);
+     if (node >= 0 && nodes > 1) {
+         unsigned long mask[4] = {0, 0, 0, 0};
+         mask[node / 64] = 1ul << (node % 64);
 diff --git a/src/ds4/ds4_undo_log.hpp b/src/ds4/ds4_undo_log.hpp
 new file mode 100644
 index 0000000..344cd76

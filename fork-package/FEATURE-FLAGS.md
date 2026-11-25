@@ -1,8 +1,10 @@
 # Feature flags and production state
 
 Compared against official v1.1.60 `8b0a449c599fbb370a1dcc0979ae7c84d4310529`.
-Values below were read from the running engine process; unset means not present
-in that process, not proof a feature could never run under another configuration.
+Values below are the **configured** values as of 2026-11-24 (env file, then the config's env block, then the
+unit drop-in; see `production-settings.json`). The 2026-11-13 version of this table was read from a live
+process; this refresh was written with the service stopped. Unset means not configured, not proof a feature
+could never run under another configuration.
 See `FLAG-OCCURRENCES.md` for every DS4/STRATA/MAYA name in added or removed
 patch lines, exact source references, and the filtered live values. The source
 has conditional paths, compile-time guards and aliases: setting a flag alone
@@ -11,10 +13,11 @@ new implementation in this patch.
 
 | Flag(s) | Meaning and default in reconstructed source | Live state |
 |---|---|---|
-| `DS4_UNDO_LOG` | Rewind horizon in tokens; default 0 disables per-layer log. | `16384` |
+| `DS4_UNDO_LOG` | Rewind horizon in tokens; default 0 disables per-layer log. | `8192` (was `16384` in the 2026-11-13 snapshot) |
 | `DS4_UNDO_HOST` | Put undo buffers in mapped pinned host memory rather than VRAM; default off. | `1` |
 | `DS4_UNDO_VERIFY` | Read back and verify touched rewind slots; default off, diagnostic. | unset |
 | `DS4_UNDO_FIRST` | Prototype in-place rewind before parking conversation slots; default off. | unset |
+| `MAYA_DS4_THP` | (2026-11-22) `0`/unset: `MADV_NOHUGEPAGE` on anonymous RAM-tier mappings; `1`: huge pages as upstream. | `0` (config env and unit drop-in `thp.conf`) |
 | `DS4_INDEX_ALL_FAST` | For eligible single-token, unrestricted indexer rows, select all when all positions fit top-k. Default off. | `1` |
 | `DS4_INDEX_QUERY_SKIP` | Additionally skip query work in the applicable all-selected case; default off. | unset |
 | `DS4_INDEX_CAND_ALL_FAST` | Extend fast selection to eligible candidate construction; default off. | unset |
@@ -40,8 +43,8 @@ DSpark. These are not automatically local source additions. The complete
 filtered live process snapshot is in `production-settings.json`; it deliberately
 omits unrelated process environment and credentials.
 
-The executable was built using CUDA 12.8, SM70, Release `-O3`,
-`DS4_CUDA_PEER_AR=1`, and `STRATA_NATIVE_EXPERTS=1`. The active configuration is
-TP4, one serving slot, 1,048,576 context, prefill chunk 1024, DSpark on/confidence
+The current executable (`3235039e…`, built 2026-11-22 from production commit `c0e574b`) was built using CUDA 12.8, SM70, Release `-O3`,
+`DS4_CUDA_PEER_AR=1`, and `STRATA_NATIVE_EXPERTS=1`. The configured deployment is
+TP4, one serving slot, the Huihui UD-IQ2_XXS pack with the D1 drafter (`maya-ds4-d1`), 1,048,576 context, prefill chunk 1024, DSpark on/confidence
 0.5, vision on and four V100S at 150 W. These are machine-specific deployment
 choices, not assumed upstream defaults.

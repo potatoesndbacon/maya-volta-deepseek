@@ -1,13 +1,11 @@
 {
   "upstream_commit": "8b0a449c599fbb370a1dcc0979ae7c84d4310529",
-  "patch_sha256": "f2df4415010402f8683bf8a6894d97ecb8e246a403ace0f3f423556aba98297d",
+  "patch_sha256": "d890ea40201b33d2267e456d3133dade379bf2df3bb42023be444cad1a87e36c",
   "patch_applied_to_clean_upstream": true,
-  "changed_files_checked": 15,
-  "reconstructed_source_matches": 15,
-  "live_source_matches": 15,
-  "production_binary_sha256": "a0cc17c94e17e398f7053947f3f062214d1e2fb410196f1cb8331add8a24429a",
+  "changed_files_checked": 16,
+  "production_binary_sha256": "3235039e510f1689cac5ebc4616d81542746096c2524123a502bbd8ccc5171c0",
   "binary_rebuild_performed": false,
-  "diff_check": "One trailing-space cleanup in src/ds4/ds4_main.cpp after source reconstruction; source-file-identities.json records final matching hashes.",
+  "diff_check": "The production tree keeps one trailing space in src/ds4/ds4_main.cpp; the package now carries it byte for byte so the fork matches the production commit exactly.",
   "clean_build": {
     "performed": true,
     "configuration": "CMake 3.31.6, CUDA 12.8.93, GCC 12.2, Release, CUDA SM70",
@@ -19,5 +17,10 @@
       "ds4_iq512_rows_default",
       "ds4_iq_host_test"
     ]
-  }
+  },
+  "refreshed": "2026-11-24",
+  "production_source_commit": "c0e574b9be2cd558db593345f886bf752519b466",
+  "production_source_branch": "maya-volta-deepseek-1.1.60-prod (worktree /home/oui/maya-v1.1.60-port)",
+  "fork_tree_matches_production_commit": 16,
+  "production_binary_built": "2026-11-22 12:50 from the production source tree (no source file newer than the binary)"
 }

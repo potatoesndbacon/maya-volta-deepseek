@@ -2553,7 +2553,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                         }
                         stepped = true;
                     }
-                    if (trace_step) {
+                    if (trace_step) { 
 #if MAYA_HAVE_NVTX
                         nvtxRangePop();
 #endif

@@ -1,6 +1,6 @@
 # Complete changed source hunk index
 
-Generated from the complete patch, including the two previously untracked files. Hunk locations refer to the official tag and reconstructed source; the patch contains every exact line change.
+Generated 2026-11-24 from the complete patch `8b0a449..c0e574b`, including the two new files. Hunk locations refer to the official tag and the production source; the patch contains every exact line change.
 
 ## `CMakeLists.txt`
 
@@ -149,6 +149,10 @@ Generated from the complete patch, including the two previously untracked files.
 ## `src/ds4/ds4_model.hpp`
 
 - `@@ -148,6 +148,11 @@ struct Stats {`
+
+## `src/ds4/ds4_os.hpp`
+
+- `@@ -501,7 +501,11 @@ inline void* anon_alloc(size_t bytes, int node, int nodes) {`
 
 ## `src/ds4/ds4_undo_log.hpp`
 
